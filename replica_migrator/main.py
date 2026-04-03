@@ -120,6 +120,7 @@ class ReplicaPickScreen(ModalScreen[ReplicaRow | None]):
         Binding("enter", "confirm", "Select", show=True),
         Binding("space", "confirm", "Select", show=False),
         Binding("d", "delete_replica", "Delete", show=True),
+        Binding("в", "delete_replica", "Delete", show=False),
         Binding("ctrl+c", "app.quit", "Quit", show=False),
     ]
 
@@ -799,6 +800,7 @@ class MigratorApp(App[None]):
         Binding("2", "select_disk", "Destination disk", show=True),
         Binding("3", "run_migration", "Run migration", show=True),
         Binding("q", "quit", "Quit", show=True),
+        Binding("й", "quit", "Quit", show=False),
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("up", "focus_previous", "Up", show=False),
         Binding("down", "focus_next", "Next", show=False),
