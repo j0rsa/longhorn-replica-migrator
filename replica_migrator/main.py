@@ -673,12 +673,15 @@ class MigrationScreen(Screen[None]):
             # -- Step 7: transfer files ------------------------------------
             mode_label = "Moving" if cfg.move_mode else "Copying"
             log(f"[bold][7/8][/bold] {mode_label} files: {src_mp} → {dst_mp}")
+            log("    Counting files...")
+            total_files = ops.count_files(src_mp)
+            log(f"    {total_files} files to transfer")
             transfer_ok = True
             try:
                 if cfg.move_mode:
-                    ops.move_tree(src_mp, dst_mp, log)
+                    ops.move_tree(src_mp, dst_mp, log, total_files)
                 else:
-                    ops.copy_tree(src_mp, dst_mp, log)
+                    ops.copy_tree(src_mp, dst_mp, log, total_files)
                 log("    Transfer complete")
             except Exception as exc:
                 log(f"[red][!] Transfer error: {exc}[/red]")

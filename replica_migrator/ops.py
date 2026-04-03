@@ -148,7 +148,16 @@ def unmount(mountpoint: Path) -> tuple[int, str]:
     return result.returncode, combined
 
 
-def copy_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
+def count_files(path: Path) -> int:
+    """Count transferable entries (files + symlinks) under *path*."""
+    total = 0
+    for item in path.rglob("*"):
+        if item.is_symlink() or not item.is_dir():
+            total += 1
+    return total
+
+
+def copy_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) -> None:
     """Recursively copy all files from *src* to *dst*, logging progress.
 
     Symlinks are recreated as symlinks (not followed).  Per-file errors are
@@ -199,13 +208,14 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
             log(f"    [red][!] failed {msg}[/red]")
             errors.append(msg)
         if count % 50 == 0 and count > 0:
-            log(f"    copied {count} files...")
+            pct = f" ({count * 100 // total}%)" if total else ""
+            log(f"    copied {count}/{total if total else '?'}{pct} files...")
     log(f"    copy_tree: {count} files copied, {len(errors)} errors")
     if errors:
         raise RuntimeError(f"{len(errors)} file(s) failed to copy")
 
 
-def move_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
+def move_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) -> None:
     """Recursively move all files from *src* to *dst*, logging progress.
 
     Symlinks are recreated as symlinks on the destination then removed from
@@ -259,7 +269,8 @@ def move_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
             log(f"    [red][!] failed {msg}[/red]")
             errors.append(msg)
         if count % 50 == 0 and count > 0:
-            log(f"    moved {count} files...")
+            pct = f" ({count * 100 // total}%)" if total else ""
+            log(f"    moved {count}/{total if total else '?'}{pct} files...")
     log(f"    move_tree: {count} files moved, {len(errors)} errors")
     if errors:
         raise RuntimeError(f"{len(errors)} file(s) failed to move")
