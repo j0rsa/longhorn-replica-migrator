@@ -8,6 +8,38 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+_LARGE_FILE_BYTES = 256 * 1024 * 1024   # 256 MiB — log individually
+_MOVE_CHUNK_BYTES = 512 * 1024 * 1024   # 512 MiB chunks for space-safe large-file moves
+
+
+def _chunked_move_file(src: Path, dst: Path, size: int, log: Callable[[str], None]) -> None:
+    """Move *src* to *dst* in reverse-order 512 MiB chunks.
+
+    After each chunk is safely written and fsynced to the destination,
+    the corresponding tail of the source file is truncated via ftruncate.
+    This keeps peak extra disk usage at one chunk size rather than the
+    full file size.
+    """
+    with open(src, "rb+") as sf, open(dst, "wb") as df:
+        remaining = size
+        while remaining > 0:
+            chunk_size = min(_MOVE_CHUNK_BYTES, remaining)
+            offset = remaining - chunk_size
+            sf.seek(offset)
+            data = sf.read(chunk_size)
+            df.seek(offset)
+            df.write(data)
+            df.flush()
+            os.fsync(df.fileno())
+            os.ftruncate(sf.fileno(), offset)
+            remaining = offset
+            done_mib = (size - remaining) // 1_048_576
+            total_mib = size // 1_048_576
+            pct = done_mib * 100 // (total_mib or 1)
+            log(f"    {done_mib}/{total_mib} MiB ({pct}%)...")
+    shutil.copystat(src, dst)
+    src.unlink()
+
 
 def build_pod_yaml(
     replica_path: Path,
@@ -196,6 +228,8 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) 
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         try:
             st = item.stat()
+            if st.st_size >= _LARGE_FILE_BYTES:
+                log(f"    copying large file {item.name} ({st.st_size // 1024 // 1024} MiB)...")
             if st.st_nlink > 1 and st.st_ino in inode_map:
                 os.link(inode_map[st.st_ino], dest_file)
             else:
@@ -259,6 +293,11 @@ def move_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) 
             if st.st_nlink > 1 and st.st_ino in inode_map:
                 os.link(inode_map[st.st_ino], dest_file)
                 item.unlink()
+            elif st.st_size >= _LARGE_FILE_BYTES:
+                log(f"    moving large file {item.name} ({st.st_size // 1024 // 1024} MiB)...")
+                _chunked_move_file(item, dest_file, st.st_size, log)
+                if st.st_nlink > 1:
+                    inode_map[st.st_ino] = dest_file
             else:
                 shutil.move(str(item), str(dest_file))
                 if st.st_nlink > 1:
