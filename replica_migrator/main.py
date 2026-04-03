@@ -118,6 +118,7 @@ class ReplicaPickScreen(ModalScreen[ReplicaRow | None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "dismiss_none", "Back", show=True),
         Binding("enter", "confirm", "Select", show=True),
+        Binding("space", "confirm", "Select", show=False),
         Binding("d", "delete_replica", "Delete", show=True),
         Binding("ctrl+c", "app.quit", "Quit", show=False),
     ]
@@ -237,6 +238,7 @@ class DiskPickScreen(ModalScreen[LonghornDisk | None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "dismiss_none", "Back", show=True),
         Binding("enter", "confirm", "Select", show=True),
+        Binding("space", "confirm", "Select", show=False),
         Binding("ctrl+c", "app.quit", "Quit", show=False),
     ]
 
