@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import ClassVar, cast
 
 from textual import on, work
+from textual.events import Key
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Horizontal, Vertical
@@ -383,6 +384,15 @@ class ConfigScreen(ModalScreen[MigrationConfig | None]):
     def action_dismiss_none(self) -> None:
         """Dismiss without starting a migration."""
         self.dismiss(None)
+
+    def on_key(self, event: Key) -> None:
+        """Forward Space/Enter to the focused button when one has focus."""
+        if event.key not in ("space", "enter"):
+            return
+        focused = self.focused
+        if isinstance(focused, Button):
+            focused.press()
+            event.stop()
 
     @on(Button.Pressed, "#btn_cancel")
     def on_cancel(self) -> None:
