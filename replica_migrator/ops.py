@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -150,8 +151,8 @@ def unmount(mountpoint: Path) -> tuple[int, str]:
 def copy_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
     """Recursively copy all files from *src* to *dst*, logging progress.
 
-    Copies preserve metadata via ``shutil.copy2``.  A log line is emitted
-    for every 50 files copied.
+    Symlinks are recreated as symlinks (not followed).  Per-file errors are
+    logged and collected; a RuntimeError is raised at the end if any occurred.
 
     Args:
         src: Source directory to copy from.
@@ -159,10 +160,23 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
         log: Callable that receives progress strings.
 
     Raises:
-        OSError: If any file operation fails.
+        RuntimeError: If one or more files could not be copied.
     """
     count = 0
+    errors: list[str] = []
     for item in src.rglob("*"):
+        if item.is_symlink():
+            relative = item.relative_to(src)
+            dest_link = dst / relative
+            dest_link.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dest_link.symlink_to(os.readlink(item))
+                count += 1
+            except OSError as exc:
+                msg = f"symlink {item} → {os.readlink(item)}: {exc}"
+                log(f"    [yellow][!] skipped {msg}[/yellow]")
+                errors.append(msg)
+            continue
         if item.is_dir():
             relative = item.relative_to(src)
             (dst / relative).mkdir(parents=True, exist_ok=True)
@@ -170,18 +184,26 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
         relative = item.relative_to(src)
         dest_file = dst / relative
         dest_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(item, dest_file)
-        count += 1
-        if count % 50 == 0:
+        try:
+            shutil.copy2(item, dest_file)
+            count += 1
+        except OSError as exc:
+            msg = f"{item}: {exc}"
+            log(f"    [red][!] failed {msg}[/red]")
+            errors.append(msg)
+        if count % 50 == 0 and count > 0:
             log(f"    copied {count} files...")
-    log(f"    copy_tree: {count} files total")
+    log(f"    copy_tree: {count} files copied, {len(errors)} errors")
+    if errors:
+        raise RuntimeError(f"{len(errors)} file(s) failed to copy")
 
 
 def move_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
     """Recursively move all files from *src* to *dst*, logging progress.
 
-    Uses ``shutil.move`` for each file.  A log line is emitted for every
-    50 files moved.
+    Symlinks are recreated as symlinks on the destination then removed from
+    the source.  Per-file errors are logged and collected; a RuntimeError is
+    raised at the end if any occurred.
 
     Args:
         src: Source directory to move from.
@@ -189,10 +211,24 @@ def move_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
         log: Callable that receives progress strings.
 
     Raises:
-        OSError: If any file operation fails.
+        RuntimeError: If one or more files could not be moved.
     """
     count = 0
+    errors: list[str] = []
     for item in sorted(src.rglob("*"), key=lambda p: (len(p.parts), p)):
+        if item.is_symlink():
+            relative = item.relative_to(src)
+            dest_link = dst / relative
+            dest_link.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dest_link.symlink_to(os.readlink(item))
+                item.unlink()
+                count += 1
+            except OSError as exc:
+                msg = f"symlink {item} → {os.readlink(item)}: {exc}"
+                log(f"    [yellow][!] skipped {msg}[/yellow]")
+                errors.append(msg)
+            continue
         if item.is_dir():
             relative = item.relative_to(src)
             (dst / relative).mkdir(parents=True, exist_ok=True)
@@ -200,8 +236,15 @@ def move_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
         relative = item.relative_to(src)
         dest_file = dst / relative
         dest_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(item), str(dest_file))
-        count += 1
-        if count % 50 == 0:
+        try:
+            shutil.move(str(item), str(dest_file))
+            count += 1
+        except OSError as exc:
+            msg = f"{item}: {exc}"
+            log(f"    [red][!] failed {msg}[/red]")
+            errors.append(msg)
+        if count % 50 == 0 and count > 0:
             log(f"    moved {count} files...")
-    log(f"    move_tree: {count} files total")
+    log(f"    move_tree: {count} files moved, {len(errors)} errors")
+    if errors:
+        raise RuntimeError(f"{len(errors)} file(s) failed to move")
