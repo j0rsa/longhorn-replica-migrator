@@ -1,0 +1,41 @@
+[project]
+name = "longhorn-replica-migrator"
+version = "0.1.0"
+description = "TUI for migrating data from Longhorn replica directories"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=0.47",
+]
+
+[project.scripts]
+longhorn-replica-migrator = "replica_migrator.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["replica_migrator"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pyright>=1.1",
+    "ruff>=0.8",
+]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.11"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "ANN", "B", "A", "SIM", "RUF"]
+ignore = ["ANN101", "ANN102", "ANN401"]
+
+[tool.pytest.ini_options]
+markers = ["integration: marks tests as integration"]

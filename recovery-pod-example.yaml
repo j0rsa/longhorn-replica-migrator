@@ -1,0 +1,36 @@
+# Example: run longhorn-engine against a replica dir on the host (hostPID/hostNetwork).
+# Replace <volume-name>, <volume-size-in-bytes>, and the replicas hostPath.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: longhorn-replica-recovery
+  namespace: default
+spec:
+  hostPID: true
+  hostNetwork: true
+  restartPolicy: Never
+  containers:
+  - name: recovery
+    image: longhornio/longhorn-engine:v1.10.0
+    securityContext:
+      privileged: true
+    command: ["launch-simple-longhorn"]
+    args: ["<volume-name>", "<volume-size-in-bytes>"]
+    volumeMounts:
+    - name: dev
+      mountPath: /host/dev
+    - name: proc
+      mountPath: /host/proc
+    - name: data
+      mountPath: /volume
+  volumes:
+  - name: dev
+    hostPath:
+      path: /dev
+  - name: proc
+    hostPath:
+      path: /proc
+  - name: data
+    hostPath:
+      path: /var/lib/longhorn/replicas/<replica-dir>

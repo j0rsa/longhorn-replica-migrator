@@ -1,0 +1,207 @@
+"""File-system and pod-manifest operations for the migration workflow."""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from collections.abc import Callable
+from pathlib import Path
+
+
+def build_pod_yaml(
+    replica_path: Path,
+    volume_name: str,
+    volume_size_bytes: int,
+    hostname: str,
+    image: str,
+) -> str:
+    """Render the recovery-pod manifest as a YAML string.
+
+    The pod mounts the replica directory at ``/volume`` and runs
+    ``launch-simple-longhorn`` to expose the replica data as a block device
+    at ``/dev/longhorn/<volume_name>`` on the host.
+
+    Args:
+        replica_path: Absolute path to the replica directory on the host.
+        volume_name: Name passed to ``launch-simple-longhorn`` (becomes the
+            block-device name under ``/dev/longhorn/``).
+        volume_size_bytes: Volume size in bytes passed to
+            ``launch-simple-longhorn``.
+        hostname: Kubernetes node hostname used as a ``nodeSelector``.
+        image: Container image for the recovery container.
+
+    Returns:
+        A fully-rendered Kubernetes Pod manifest as a YAML string.
+    """
+    return f"""\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: longhorn-replica-recovery
+  namespace: default
+spec:
+  hostPID: true
+  hostNetwork: true
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: "{hostname}"
+  containers:
+  - name: recovery
+    image: {image}
+    securityContext:
+      privileged: true
+    command: ["launch-simple-longhorn"]
+    args: ["{volume_name}", "{volume_size_bytes}"]
+    volumeMounts:
+    - name: dev
+      mountPath: /host/dev
+    - name: proc
+      mountPath: /host/proc
+    - name: data
+      mountPath: /volume
+  volumes:
+  - name: dev
+    hostPath:
+      path: /dev
+  - name: proc
+    hostPath:
+      path: /proc
+  - name: data
+    hostPath:
+      path: {replica_path}
+"""
+
+
+def detect_fs_type(device: Path) -> str | None:
+    """Return the filesystem type on *device*, or ``None`` if unformatted/unknown.
+
+    Args:
+        device: Block device to probe.
+
+    Returns:
+        Filesystem type string (e.g. ``"ext4"``, ``"xfs"``) or ``None``.
+    """
+    result = subprocess.run(
+        ["blkid", "-o", "value", "-s", "TYPE", str(device)],
+        capture_output=True,
+        text=True,
+    )
+    fs_type = result.stdout.strip()
+    return fs_type if fs_type else None
+
+
+def format_device(device: Path, fs_type: str) -> tuple[int, str]:
+    """Format *device* with the given filesystem type.
+
+    Args:
+        device: Block device to format.
+        fs_type: Filesystem type, e.g. ``"ext4"`` or ``"xfs"``.
+
+    Returns:
+        A 2-tuple of (returncode, combined stdout+stderr).
+    """
+    mkfs_cmd = f"mkfs.{fs_type}"
+    result = subprocess.run(
+        [mkfs_cmd, "-f", str(device)] if fs_type == "xfs" else [mkfs_cmd, str(device)],
+        capture_output=True,
+        text=True,
+    )
+    combined = (result.stdout + result.stderr).strip()
+    return result.returncode, combined
+
+
+def mount_device(device: Path, mountpoint: Path) -> tuple[int, str]:
+    """Mount a block device at the given mountpoint.
+
+    Args:
+        device: Path to the block device to mount.
+        mountpoint: Directory at which to mount the device.
+
+    Returns:
+        A 2-tuple of (returncode, combined stdout+stderr).
+    """
+    result = subprocess.run(
+        ["mount", str(device), str(mountpoint)],
+        capture_output=True,
+        text=True,
+    )
+    combined = (result.stdout + result.stderr).strip()
+    return result.returncode, combined
+
+
+def unmount(mountpoint: Path) -> tuple[int, str]:
+    """Unmount a previously mounted filesystem.
+
+    Args:
+        mountpoint: Directory that was used as the mount target.
+
+    Returns:
+        A 2-tuple of (returncode, combined stdout+stderr).
+    """
+    result = subprocess.run(
+        ["umount", str(mountpoint)],
+        capture_output=True,
+        text=True,
+    )
+    combined = (result.stdout + result.stderr).strip()
+    return result.returncode, combined
+
+
+def copy_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
+    """Recursively copy all files from *src* to *dst*, logging progress.
+
+    Copies preserve metadata via ``shutil.copy2``.  A log line is emitted
+    for every 50 files copied.
+
+    Args:
+        src: Source directory to copy from.
+        dst: Destination directory to copy into (must exist).
+        log: Callable that receives progress strings.
+
+    Raises:
+        OSError: If any file operation fails.
+    """
+    count = 0
+    for item in src.rglob("*"):
+        if item.is_dir():
+            relative = item.relative_to(src)
+            (dst / relative).mkdir(parents=True, exist_ok=True)
+            continue
+        relative = item.relative_to(src)
+        dest_file = dst / relative
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item, dest_file)
+        count += 1
+        if count % 50 == 0:
+            log(f"    copied {count} files...")
+    log(f"    copy_tree: {count} files total")
+
+
+def move_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
+    """Recursively move all files from *src* to *dst*, logging progress.
+
+    Uses ``shutil.move`` for each file.  A log line is emitted for every
+    50 files moved.
+
+    Args:
+        src: Source directory to move from.
+        dst: Destination directory to move into (must exist).
+        log: Callable that receives progress strings.
+
+    Raises:
+        OSError: If any file operation fails.
+    """
+    count = 0
+    for item in sorted(src.rglob("*"), key=lambda p: (len(p.parts), p)):
+        if item.is_dir():
+            relative = item.relative_to(src)
+            (dst / relative).mkdir(parents=True, exist_ok=True)
+            continue
+        relative = item.relative_to(src)
+        dest_file = dst / relative
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(item), str(dest_file))
+        count += 1
+        if count % 50 == 0:
+            log(f"    moved {count} files...")
+    log(f"    move_tree: {count} files total")
