@@ -164,6 +164,7 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
     """
     count = 0
     errors: list[str] = []
+    inode_map: dict[int, Path] = {}  # source inode → first dest copy
     for item in src.rglob("*"):
         if item.is_symlink():
             relative = item.relative_to(src)
@@ -185,7 +186,13 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
         dest_file = dst / relative
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.copy2(item, dest_file)
+            st = item.stat()
+            if st.st_nlink > 1 and st.st_ino in inode_map:
+                os.link(inode_map[st.st_ino], dest_file)
+            else:
+                shutil.copy2(item, dest_file)
+                if st.st_nlink > 1:
+                    inode_map[st.st_ino] = dest_file
             count += 1
         except OSError as exc:
             msg = f"{item}: {exc}"
@@ -215,6 +222,7 @@ def move_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
     """
     count = 0
     errors: list[str] = []
+    inode_map: dict[int, Path] = {}  # source inode → first dest copy
     for item in sorted(src.rglob("*"), key=lambda p: (len(p.parts), p)):
         if item.is_symlink():
             relative = item.relative_to(src)
@@ -237,7 +245,14 @@ def move_tree(src: Path, dst: Path, log: Callable[[str], None]) -> None:
         dest_file = dst / relative
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.move(str(item), str(dest_file))
+            st = item.stat()
+            if st.st_nlink > 1 and st.st_ino in inode_map:
+                os.link(inode_map[st.st_ino], dest_file)
+                item.unlink()
+            else:
+                shutil.move(str(item), str(dest_file))
+                if st.st_nlink > 1:
+                    inode_map[st.st_ino] = dest_file
             count += 1
         except OSError as exc:
             msg = f"{item}: {exc}"
