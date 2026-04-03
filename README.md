@@ -86,13 +86,13 @@ pipx upgrade longhorn-replica-migrator
 python3 -m venv /opt/replica-migrator
 /opt/replica-migrator/bin/pip install dist/longhorn_replica_migrator-*.whl
 # run via full path:
-/opt/replica-migrator/bin/replica-migrator /var/lib/longhorn/replicas
+/opt/replica-migrator/bin/longhorn-replica-migrator /var/lib/longhorn/replicas
 ```
 
 ### Run without installing (development)
 
 ```bash
-uv run replica-migrator /var/lib/longhorn/replicas
+uv run longhorn-replica-migrator /var/lib/longhorn/replicas
 ```
 
 ---
@@ -100,7 +100,7 @@ uv run replica-migrator /var/lib/longhorn/replicas
 ## Usage
 
 ```
-replica-migrator <replicas_dir> [--dev-root /dev/longhorn]
+longhorn-replica-migrator <replicas_dir> [--dev-root /dev/longhorn]
 ```
 
 | Argument | Default | Description |
@@ -111,7 +111,7 @@ replica-migrator <replicas_dir> [--dev-root /dev/longhorn]
 Example:
 
 ```bash
-replica-migrator /var/lib/longhorn/replicas
+longhorn-replica-migrator /var/lib/longhorn/replicas
 ```
 
 ---
