@@ -455,7 +455,7 @@ class MigrationScreen(Screen[None]):
     }
     #status_line {
         padding: 1 2 0 2;
-        height: 3;
+        height: 4;
         background: $surface;
         border-bottom: solid $primary;
     }
