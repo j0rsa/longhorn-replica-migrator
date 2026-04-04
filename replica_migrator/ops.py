@@ -361,7 +361,15 @@ def deflate_source_imgs(
         dev_gib = int(size_result.stdout.strip()) / 1024 ** 3
         log(f"    [deflate] device size: {dev_gib:.1f} GiB")
 
+    # Snapshot .img disk usage before fstrim so we can decide whether
+    # fallocate is worth running afterwards.
+    def _img_blocks() -> int:
+        return sum(img.stat().st_blocks for img in replica_path.glob("*.img"))
+
+    before_blocks = _img_blocks()
+
     # Step 1: fstrim via a temporary discard mount.
+    fstrim_ok = False
     tmp_mp = Path(tempfile.mkdtemp(prefix="lrm-trim-"))
     try:
         log("    [deflate] mounting with -o discard for fstrim...")
@@ -373,15 +381,26 @@ def deflate_source_imgs(
         else:
             log("    [deflate] fstrim: sending DISCARD for all free blocks...")
             rc_trim = _stream_cmd(["fstrim", "-v", str(tmp_mp)], log)
-            if rc_trim != 0:
+            fstrim_ok = rc_trim == 0
+            if not fstrim_ok:
                 log("    [yellow][deflate] fstrim failed (DISCARD may not be supported)[/yellow]")
             unmount(tmp_mp)
     finally:
         tmp_mp.rmdir()
 
-    # Step 2: fallocate --dig-holes on every .img file.
+    after_fstrim_blocks = _img_blocks()
+    freed_by_fstrim = (before_blocks - after_fstrim_blocks) * 512 // 1_048_576
+    log(f"    [deflate] fstrim freed {freed_by_fstrim} MiB from .img files")
+
+    # Step 2: fallocate --dig-holes — only run if fstrim made no progress,
+    # which means the engine zeroed blocks instead of punching holes.
+    # When fstrim works correctly this step is a slow no-op scan and can be skipped.
+    if fstrim_ok and freed_by_fstrim > 0:
+        log("    [deflate] fstrim freed space — skipping fallocate (not needed)")
+        return
+
     imgs = sorted(replica_path.glob("*.img"))
-    log(f"    [deflate] fallocate --dig-holes on {len(imgs)} .img file(s)...")
+    log(f"    [deflate] fstrim made no progress — running fallocate --dig-holes on {len(imgs)} .img file(s)...")
     for img in imgs:
         before = img.stat().st_blocks * 512
         rc = _stream_cmd(["fallocate", "--dig-holes", str(img)], log)
