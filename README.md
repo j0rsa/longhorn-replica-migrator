@@ -12,6 +12,56 @@ configured to reach the cluster API server.  **The tool must be run as `root`** 
 
 ---
 
+## The space problem — and how this tool solves it
+
+Migrating a Longhorn replica to a new volume on the **same physical disk** creates
+an obvious problem: you need space for both the old data and the new copy
+simultaneously.  A naïve copy of a 4 TiB replica requires 8 TiB free — which is
+rarely available on a storage node that is already under pressure.
+
+This tool solves it with **Move + Deflate** mode:
+
+### Large-file chunked transfer
+
+Individual files larger than 256 MiB are moved in **512 MiB reverse-order chunks**.
+After each chunk is safely written and `fsync`'d to the destination, the
+corresponding tail of the source file is removed via `ftruncate`.  At any point
+during the transfer:
+
+```
+peak disk usage ≈ source_remaining + destination_written + 512 MiB chunk
+                = total_data  (constant)
+```
+
+instead of `2 × total_data` with a standard copy.
+
+### Periodic source deflation
+
+Every 100 GiB transferred the tool **pauses, unmounts the source, and deflates it**:
+
+1. Mounts the source block device briefly with `-o discard` and runs `fstrim`.
+   This sends DISCARD/UNMAP commands to the Longhorn engine, which punches holes
+   directly in the backing `.img` sparse files — freeing host disk blocks
+   **without** a temporary space spike.
+2. Runs `fallocate --dig-holes` on every `.img` file to convert any zero regions
+   the engine wrote rather than holed.
+3. Remounts and resumes the transfer.
+
+> **Why not `zerofree`?**  `zerofree` writes actual zeros to every free block on
+> the filesystem.  Because Longhorn `.img` files are sparse, those free blocks are
+> already stored as holes (zero host-disk cost).  Materialising them with zeros
+> *increases* disk usage before `fallocate` can recover it — exactly the wrong
+> direction on a disk that is nearly full.  `fstrim` + DISCARD lets the Longhorn
+> engine punch holes directly, with no intermediate space spike.
+
+### On-demand deflation
+
+Button **4 · Deflate source replica** in the main menu runs the deflation cycle
+independently at any time — useful for reclaiming space before starting a migration
+or after an interrupted run.
+
+---
+
 ## How it works
 
 Longhorn stores replica data as raw files on the node's filesystem.  When a volume
@@ -140,7 +190,7 @@ Press **3 · Configure & Run Migration**.  A modal form appears:
 |-------|---------|-------------|
 | Node hostname | auto-detected | Used as `kubernetes.io/hostname` node selector |
 | Longhorn engine image | `longhornio/longhorn-engine:v1.10.0` | Container image for the recovery pod |
-| Transfer mode | Copy | Copy (safe) or Move (destructive) |
+| Transfer mode | Copy | Copy (safe), Move (destructive), or Move + Deflate (space-efficient) |
 | Delete source replica dir | Off | Remove the replica directory after transfer |
 
 Press **Run Migration →** to start.
@@ -175,6 +225,12 @@ All progress is streamed to the log panel in real time.
 
 ## Transfer modes
 
+| Mode | Safe? | Space needed | When to use |
+|------|-------|-------------|-------------|
+| **Copy** | Yes — source intact | 2 × data size | You have spare disk space and want a fallback |
+| **Move** | No undo | 2 × data size peak | Sufficient free space, fastest completion |
+| **Move + Deflate** | No undo | ≈ 1 × data size | Source and destination share the same physical disk |
+
 ### Copy (safe, default)
 
 Files are copied with `shutil.copy2` (preserving metadata).  The original replica
@@ -182,9 +238,19 @@ directory is left intact.  Use this when you want a fallback.
 
 ### Move (destructive)
 
-Files are moved with `shutil.move`.  This frees disk space on the source
-immediately.  **There is no undo.**  Only use move mode when you are confident the
-migration will succeed and you have verified the target volume beforehand.
+Files are moved one at a time.  Each moved file is immediately deleted from the
+source, so disk usage trends down as the transfer progresses.  Peak usage is still
+up to 2 × data size for a single large file being copied before its source is
+removed.  **There is no undo.**
+
+### Move + Deflate (space-efficient, recommended for tight disks)
+
+Same as Move, but every 100 GiB the source is deflated via `fstrim` + DISCARD so
+the Longhorn engine punches holes in the backing `.img` files.  Combined with
+512 MiB chunked large-file moves, peak extra disk usage is kept to roughly one
+chunk (512 MiB) above the already-transferred data.  See
+[The space problem](#the-space-problem--and-how-this-tool-solves-it) above for the
+full explanation.
 
 ---
 
