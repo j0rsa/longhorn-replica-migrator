@@ -704,6 +704,8 @@ class MigrationScreen(Screen[None]):
 
             def _do_deflate() -> None:
                 assert src_mp is not None
+                log("[bold][deflate][/bold] Flushing filesystem journal...")
+                ops.sync_fs(src_mp)
                 log("[bold][deflate][/bold] Unmounting source for deflation...")
                 ops.unmount(src_mp)
                 ops.deflate_source_imgs(cfg.replica.path, src_device, src_fs, log)

@@ -217,6 +217,17 @@ def format_device(device: Path, fs_type: str) -> tuple[int, str]:
     return result.returncode, combined
 
 
+def sync_fs(mountpoint: Path) -> None:
+    """Flush and commit the journal for the filesystem at *mountpoint*.
+
+    Runs ``sync -f <mountpoint>`` which flushes only that filesystem's dirty
+    pages and commits all pending journal transactions.  Call this before
+    unmounting to guarantee a clean on-disk state so that a subsequent
+    remount for fstrim finds no journal replay needed.
+    """
+    subprocess.run(["sync", "-f", str(mountpoint)], check=False)
+
+
 def mount_device(device: Path, mountpoint: Path, extra_opts: str = "") -> tuple[int, str]:
     """Mount a block device at the given mountpoint.
 
