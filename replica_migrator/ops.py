@@ -368,22 +368,27 @@ def deflate_source_imgs(
 
     before_blocks = _img_blocks()
 
-    # Step 1: fstrim via a temporary discard mount.
+    # Step 1: fstrim via a temporary mount.
+    # Note: fstrim does NOT require the filesystem to be mounted with -o discard.
+    # The discard mount option enables real-time per-deletion TRIM; fstrim is a
+    # batch operation that sends FITRIM ioctl independently of mount options.
+    # Mounting with -o discard on a filesystem that has prior journal state causes
+    # FITRIM to return EBADMSG ("Bad message"), so we use a plain mount here.
     fstrim_ok = False
     tmp_mp = Path(tempfile.mkdtemp(prefix="lrm-trim-"))
     try:
-        log("    [deflate] mounting with -o discard for fstrim...")
-        rc_mnt, out_mnt = mount_device(src_device, tmp_mp, extra_opts="discard")
+        log("    [deflate] mounting source for fstrim...")
+        rc_mnt, out_mnt = mount_device(src_device, tmp_mp)
         if out_mnt:
             log(f"    {out_mnt}")
         if rc_mnt != 0:
-            log("    [yellow][deflate] discard mount failed — skipping fstrim[/yellow]")
+            log("    [yellow][deflate] mount failed — skipping fstrim[/yellow]")
         else:
             log("    [deflate] fstrim: sending DISCARD for all free blocks...")
             rc_trim = _stream_cmd(["fstrim", "-v", str(tmp_mp)], log)
             fstrim_ok = rc_trim == 0
             if not fstrim_ok:
-                log("    [yellow][deflate] fstrim failed (DISCARD may not be supported)[/yellow]")
+                log("    [yellow][deflate] fstrim failed (DISCARD may not be supported by this Longhorn engine version)[/yellow]")
             unmount(tmp_mp)
     finally:
         tmp_mp.rmdir()
@@ -391,26 +396,6 @@ def deflate_source_imgs(
     after_fstrim_blocks = _img_blocks()
     freed_by_fstrim = (before_blocks - after_fstrim_blocks) * 512 // 1_048_576
     log(f"    [deflate] fstrim freed {freed_by_fstrim} MiB from .img files")
-
-    # Step 2: fallocate --dig-holes — only run if fstrim made no progress,
-    # which means the engine zeroed blocks instead of punching holes.
-    # When fstrim works correctly this step is a slow no-op scan and can be skipped.
-    if fstrim_ok and freed_by_fstrim > 0:
-        log("    [deflate] fstrim freed space — skipping fallocate (not needed)")
-        return
-
-    imgs = sorted(replica_path.glob("*.img"))
-    log(f"    [deflate] fstrim made no progress — running fallocate --dig-holes on {len(imgs)} .img file(s)...")
-    for img in imgs:
-        before = img.stat().st_blocks * 512
-        rc = _stream_cmd(["fallocate", "--dig-holes", str(img)], log)
-        after = img.stat().st_blocks * 512
-        freed = (before - after) // 1_048_576
-        status = f"freed {freed} MiB" if freed > 0 else "no change"
-        if rc != 0:
-            log(f"    [yellow]{img.name}: fallocate failed ({status})[/yellow]")
-        else:
-            log(f"    {img.name}: {status}")
 
 
 def move_tree(
