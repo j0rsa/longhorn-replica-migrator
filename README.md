@@ -43,8 +43,11 @@ Every 100 GiB transferred the tool **pauses, unmounts the source, and deflates i
    This sends DISCARD/UNMAP commands to the Longhorn engine, which punches holes
    directly in the backing `.img` sparse files — freeing host disk blocks
    **without** a temporary space spike.
-2. Runs `fallocate --dig-holes` on every `.img` file to convert any zero regions
-   the engine wrote rather than holed.
+2. Measures `.img` block usage before and after `fstrim`.  If `fstrim` freed space
+   (the common case), `fallocate --dig-holes` is **skipped** — the engine already
+   punched the holes and scanning a multi-TiB sparse file for zeros would be a slow
+   no-op.  `fallocate` only runs as a fallback when `fstrim` made no progress,
+   meaning the engine zeroed blocks instead of holing them.
 3. Remounts and resumes the transfer.
 
 > **Why not `zerofree`?**  `zerofree` writes actual zeros to every free block on
