@@ -275,7 +275,8 @@ def count_files(path: Path) -> int:
     return total
 
 
-def copy_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) -> None:
+def copy_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0,
+              progress_cb: Callable[[int, int], None] | None = None) -> None:
     """Recursively copy all files from *src* to *dst*, logging progress.
 
     Symlinks are recreated as symlinks (not followed).  Per-file errors are
@@ -323,6 +324,8 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) 
                 if st.st_nlink > 1:
                     inode_map[st.st_ino] = dest_file
             count += 1
+            if progress_cb:
+                progress_cb(count, total)
         except OSError as exc:
             msg = f"{item}: {exc}"
             log(f"    [red][!] failed {msg}[/red]")
@@ -417,6 +420,7 @@ def move_tree(
     deflate_every_bytes: int = 0,
     deflate_cb: Callable[[], None] | None = None,
     state_file: Path | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
 ) -> None:
     """Recursively move all files from *src* to *dst*, logging progress.
 
@@ -484,6 +488,8 @@ def move_tree(
                         _save_inode_state(state_file, inode_map, dst)
             count += 1
             bytes_since_deflate += st.st_size
+            if progress_cb:
+                progress_cb(count, total)
         except OSError as exc:
             msg = f"{item}: {exc}"
             log(f"    [red][!] failed {msg}[/red]")

@@ -486,6 +486,13 @@ class MigrationScreen(Screen[None]):
             super().__init__()
             self.text = text
 
+    class StatusUpdate(Message):
+        """Updates the status bar with overall transfer progress."""
+
+        def __init__(self, text: str) -> None:
+            super().__init__()
+            self.text = text
+
     class Done(Message):
         """Signals that the migration thread has finished.
 
@@ -525,17 +532,10 @@ class MigrationScreen(Screen[None]):
         self._start_migration()
 
     def on_migration_screen_log_line(self, event: MigrationScreen.LogLine) -> None:
-        """Append a log line to the RichLog widget.
+        self.query_one("#log_box", RichLog).write(event.text)
 
-        Args:
-            event: The log line message.
-        """
-        log_box = self.query_one("#log_box", RichLog)
-        log_box.write(event.text)
-        status = self.query_one("#status_line", Static)
-        # Strip markup for plain status
-        plain = event.text.replace("[/bold]", "").replace("[bold]", "")
-        status.update(plain)
+    def on_migration_screen_status_update(self, event: MigrationScreen.StatusUpdate) -> None:
+        self.query_one("#status_line", Static).update(event.text)
 
     def on_migration_screen_done(self, event: MigrationScreen.Done) -> None:
         """Handle migration completion — update button and status.
@@ -577,8 +577,12 @@ class MigrationScreen(Screen[None]):
         def log(text: str) -> None:
             self.post_message(MigrationScreen.LogLine(text))
 
+        def status(text: str) -> None:
+            self.post_message(MigrationScreen.StatusUpdate(text))
+
         try:
             # -- Pre-flight -------------------------------------------------
+            status("Checking kubectl...")
             log("[bold][pre][/bold] Checking kubectl...")
             rc, out, err = kube.run_cmd("kubectl", "version", "--client")
             if out:
@@ -612,6 +616,7 @@ class MigrationScreen(Screen[None]):
                 cfg.hostname,
                 cfg.image,
             )
+            status(f"[3/8] Applying recovery pod...")
             log(f"[bold][3/8][/bold] Applying recovery pod ({cfg.image})...")
             rc, out = kube.apply_yaml(yaml_str)
             if out:
@@ -621,6 +626,7 @@ class MigrationScreen(Screen[None]):
                 return
 
             # -- Step 4: wait for pod Running -------------------------------
+            status("[4/8] Waiting for pod Running...")
             log("[bold][4/8][/bold] Waiting for pod Running (up to 120 s)...")
             ok = kube.wait_pod_running()
             if not ok:
@@ -630,6 +636,7 @@ class MigrationScreen(Screen[None]):
             log("    Pod is Running")
 
             # -- Step 5: wait for source device -----------------------------
+            status(f"[5/8] Waiting for device {src_device}...")
             log(f"[bold][5/8][/bold] Waiting for source device {src_device} (up to 60 s)...")
             ok = kube.wait_device(src_device, 60)
             if not ok:
@@ -642,6 +649,7 @@ class MigrationScreen(Screen[None]):
             src_mp = Path(tempfile.mkdtemp(prefix="lrm-src-"))
             dst_mp = Path(tempfile.mkdtemp(prefix="lrm-dst-"))
 
+            status("[6/8] Mounting devices...")
             log(f"[bold][6/8][/bold] Mounting source {src_device} → {src_mp}")
             rc, out = ops.mount_device(src_device, src_mp)
             if out:
@@ -694,10 +702,12 @@ class MigrationScreen(Screen[None]):
             # -- Step 7: transfer files ------------------------------------
             mode = cfg.transfer_mode
             mode_label = "Copying" if mode == TransferMode.COPY else "Moving"
+            status(f"[7/8] Counting files...")
             log(f"[bold][7/8][/bold] {mode_label} files: {src_mp} → {dst_mp}")
             log("    Counting files...")
             total_files = ops.count_files(src_mp)
             log(f"    {total_files} files to transfer")
+            status(f"[7/8] {mode_label} 0/{total_files} (0%)")
             transfer_ok = True
 
             _DEFLATE_EVERY = 100 * 1024 ** 3  # 100 GiB
@@ -717,16 +727,25 @@ class MigrationScreen(Screen[None]):
                     raise RuntimeError("Failed to remount source after deflation")
 
             try:
+                mode_word = "Copied" if mode == TransferMode.COPY else "Moved"
+
+                def _progress(done: int, total: int) -> None:
+                    pct = f" ({done * 100 // total}%)" if total else ""
+                    self.post_message(MigrationScreen.StatusUpdate(
+                        f"{mode_word} {done}/{total if total else '?'}{pct} files"
+                    ))
+
                 state_file = cfg.replica.path / ".lrm_inode_state.json"
                 if mode == TransferMode.COPY:
-                    ops.copy_tree(src_mp, dst_mp, log, total_files)
+                    ops.copy_tree(src_mp, dst_mp, log, total_files,
+                                  progress_cb=_progress)
                 elif mode == TransferMode.MOVE:
                     ops.move_tree(src_mp, dst_mp, log, total_files,
-                                  state_file=state_file)
+                                  state_file=state_file, progress_cb=_progress)
                 else:  # MOVE_DEFLATE
                     ops.move_tree(src_mp, dst_mp, log, total_files,
                                   deflate_every_bytes=_DEFLATE_EVERY, deflate_cb=_do_deflate,
-                                  state_file=state_file)
+                                  state_file=state_file, progress_cb=_progress)
                 log("    Transfer complete")
             except Exception as exc:
                 log(f"[red][!] Transfer error: {exc}[/red]")
