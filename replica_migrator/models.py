@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+
+
+class TransferMode(Enum):
+    COPY = "copy"
+    MOVE = "move"
+    MOVE_DEFLATE = "move_deflate"
 
 
 @dataclass(frozen=True)
@@ -48,8 +55,8 @@ class MigrationConfig:
     image: str
     """Container image for the longhorn-engine recovery container."""
 
-    move_mode: bool
-    """If ``True``, move files (destructive); if ``False``, copy (safe)."""
+    transfer_mode: TransferMode
+    """Copy, Move, or Move+Deflate."""
 
     delete_replica: bool
     """If ``True``, delete the source replica directory after transfer."""

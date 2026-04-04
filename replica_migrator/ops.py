@@ -249,7 +249,59 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) 
         raise RuntimeError(f"{len(errors)} file(s) failed to copy")
 
 
-def move_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) -> None:
+def deflate_source_imgs(
+    replica_path: Path,
+    src_device: Path,
+    fs_type: str | None,
+    log: Callable[[str], None],
+) -> None:
+    """Free host disk space used by a Longhorn replica after files have been moved out.
+
+    The source block device must be **unmounted** before calling this.
+
+    Steps:
+    1. ``zerofree`` (ext4) or a no-op warning (other FS) — writes actual zero
+       bytes into the free blocks of the block device, which flows through the
+       Longhorn engine into the backing ``.img`` sparse files.
+    2. ``fallocate --dig-holes`` on every ``.img`` file — the kernel detects
+       zero regions and replaces them with sparse holes, which the host OS
+       then releases as free disk blocks.
+    """
+    if fs_type == "ext4":
+        log("    [deflate] zerofree: zeroing free blocks on source device (may take a while)...")
+        result = subprocess.run(["zerofree", str(src_device)], capture_output=True, text=True)
+        out = (result.stdout + result.stderr).strip()
+        if out:
+            log(f"    {out}")
+        if result.returncode != 0:
+            log("    [yellow][deflate] zerofree failed — skipping hole punching[/yellow]")
+            return
+    else:
+        log(f"    [yellow][deflate] No zerofree for {fs_type} — hole punching may recover fewer blocks[/yellow]")
+
+    imgs = sorted(replica_path.glob("*.img"))
+    log(f"    [deflate] fallocate --dig-holes on {len(imgs)} .img file(s)...")
+    for img in imgs:
+        before = img.stat().st_blocks * 512
+        result = subprocess.run(["fallocate", "--dig-holes", str(img)], capture_output=True, text=True)
+        out = (result.stdout + result.stderr).strip()
+        after = img.stat().st_blocks * 512
+        freed = (before - after) // 1_048_576
+        status = f"freed {freed} MiB" if freed > 0 else "no change"
+        if out:
+            log(f"    {img.name}: {out} ({status})")
+        else:
+            log(f"    {img.name}: {status}")
+
+
+def move_tree(
+    src: Path,
+    dst: Path,
+    log: Callable[[str], None],
+    total: int = 0,
+    deflate_every_bytes: int = 0,
+    deflate_cb: Callable[[], None] | None = None,
+) -> None:
     """Recursively move all files from *src* to *dst*, logging progress.
 
     Symlinks are recreated as symlinks on the destination then removed from
@@ -267,7 +319,13 @@ def move_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) 
     count = 0
     errors: list[str] = []
     inode_map: dict[int, Path] = {}  # source inode → first dest copy
-    for item in sorted(src.rglob("*"), key=lambda p: (len(p.parts), p)):
+    bytes_since_deflate = 0
+    # Pre-collect so we can resume the same list after unmount/remount cycles.
+    all_items = sorted(src.rglob("*"), key=lambda p: (len(p.parts), p))
+    for item in all_items:
+        # Skip items already moved in a previous pass (e.g. after remount).
+        if not item.is_symlink() and not item.exists():
+            continue
         if item.is_symlink():
             relative = item.relative_to(src)
             dest_link = dst / relative
@@ -303,6 +361,7 @@ def move_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) 
                 if st.st_nlink > 1:
                     inode_map[st.st_ino] = dest_file
             count += 1
+            bytes_since_deflate += st.st_size
         except OSError as exc:
             msg = f"{item}: {exc}"
             log(f"    [red][!] failed {msg}[/red]")
@@ -310,6 +369,10 @@ def move_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) 
         if count % 50 == 0 and count > 0:
             pct = f" ({count * 100 // total}%)" if total else ""
             log(f"    moved {count}/{total if total else '?'}{pct} files...")
+        if deflate_cb and deflate_every_bytes > 0 and bytes_since_deflate >= deflate_every_bytes:
+            log(f"    [deflate] {bytes_since_deflate // 1_073_741_824} GiB moved — triggering source deflation...")
+            deflate_cb()
+            bytes_since_deflate = 0
     log(f"    move_tree: {count} files moved, {len(errors)} errors")
     if errors:
         raise RuntimeError(f"{len(errors)} file(s) failed to move")

@@ -35,7 +35,7 @@ from textual.widgets import (
 from replica_migrator import kubectl as kube
 from replica_migrator import ops
 from replica_migrator.kubectl import DEFAULT_IMAGE
-from replica_migrator.models import LonghornDisk, MigrationConfig, ReplicaRow
+from replica_migrator.models import LonghornDisk, MigrationConfig, ReplicaRow, TransferMode
 from replica_migrator.scan import format_size, list_longhorn_disks, resolve_replicas_root, scan_replicas
 
 DEFAULT_LONGHORN_DEV = Path("/dev/longhorn")
@@ -375,6 +375,10 @@ class ConfigScreen(ModalScreen[MigrationConfig | None]):
                     "Move — destructive, frees source disk space",
                     id="rb_move",
                 )
+                yield RadioButton(
+                    "Move + Deflate — move and shrink source .img files every 100 GiB",
+                    id="rb_move_deflate",
+                )
             yield Label("Delete source replica dir after transfer?")
             yield Switch(False, id="delete_switch")
             with Horizontal(id="config_btn_row"):
@@ -407,7 +411,13 @@ class ConfigScreen(ModalScreen[MigrationConfig | None]):
 
         mode_radio = self.query_one("#mode_radio", RadioSet)
         pressed = mode_radio.pressed_button
-        move_mode = pressed is not None and pressed.id == "rb_move"
+        pressed_id = pressed.id if pressed is not None else "rb_copy"
+        if pressed_id == "rb_move":
+            transfer_mode = TransferMode.MOVE
+        elif pressed_id == "rb_move_deflate":
+            transfer_mode = TransferMode.MOVE_DEFLATE
+        else:
+            transfer_mode = TransferMode.COPY
 
         delete_switch = self.query_one("#delete_switch", Switch)
         delete_replica = bool(delete_switch.value)
@@ -417,7 +427,7 @@ class ConfigScreen(ModalScreen[MigrationConfig | None]):
             disk=self._disk,
             hostname=self._hostname,
             image=image,
-            move_mode=move_mode,
+            transfer_mode=transfer_mode,
             delete_replica=delete_replica,
         )
         self.dismiss(cfg)
@@ -682,17 +692,36 @@ class MigrationScreen(Screen[None]):
                 return
 
             # -- Step 7: transfer files ------------------------------------
-            mode_label = "Moving" if cfg.move_mode else "Copying"
+            mode = cfg.transfer_mode
+            mode_label = "Copying" if mode == TransferMode.COPY else "Moving"
             log(f"[bold][7/8][/bold] {mode_label} files: {src_mp} → {dst_mp}")
             log("    Counting files...")
             total_files = ops.count_files(src_mp)
             log(f"    {total_files} files to transfer")
             transfer_ok = True
+
+            _DEFLATE_EVERY = 100 * 1024 ** 3  # 100 GiB
+
+            def _do_deflate() -> None:
+                assert src_mp is not None
+                log("[bold][deflate][/bold] Unmounting source for deflation...")
+                ops.unmount(src_mp)
+                ops.deflate_source_imgs(cfg.replica.path, src_device, src_fs, log)
+                log("[bold][deflate][/bold] Remounting source, resuming transfer...")
+                rc_d, out_d = ops.mount_device(src_device, src_mp)
+                if out_d:
+                    log(f"    {out_d}")
+                if rc_d != 0:
+                    raise RuntimeError("Failed to remount source after deflation")
+
             try:
-                if cfg.move_mode:
-                    ops.move_tree(src_mp, dst_mp, log, total_files)
-                else:
+                if mode == TransferMode.COPY:
                     ops.copy_tree(src_mp, dst_mp, log, total_files)
+                elif mode == TransferMode.MOVE:
+                    ops.move_tree(src_mp, dst_mp, log, total_files)
+                else:  # MOVE_DEFLATE
+                    ops.move_tree(src_mp, dst_mp, log, total_files,
+                                  deflate_every_bytes=_DEFLATE_EVERY, deflate_cb=_do_deflate)
                 log("    Transfer complete")
             except Exception as exc:
                 log(f"[red][!] Transfer error: {exc}[/red]")
