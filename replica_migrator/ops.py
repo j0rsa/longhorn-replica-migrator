@@ -50,6 +50,7 @@ def _stream_cmd(cmd: list[str], log: Callable[[str], None]) -> int:
 
 _LARGE_FILE_BYTES = 256 * 1024 * 1024   # 256 MiB — log individually
 _MOVE_CHUNK_BYTES = 512 * 1024 * 1024   # 512 MiB chunks for space-safe large-file moves
+_SENDFILE_BLOCK   = 128 * 1024 * 1024   # 128 MiB per sendfile call (no Python heap alloc)
 _STATE_VERSION = 1
 
 
@@ -99,11 +100,19 @@ def _chunked_move_file(src: Path, dst: Path, size: int, log: Callable[[str], Non
         while remaining > 0:
             chunk_size = min(_MOVE_CHUNK_BYTES, remaining)
             offset = remaining - chunk_size
-            sf.seek(offset)
-            data = sf.read(chunk_size)
+            # Stream via sendfile in sub-blocks — no Python heap allocation.
+            # os.sendfile(out_fd, in_fd, in_offset, count) reads from in_offset
+            # in the source and writes at the current position of out_fd.
             df.seek(offset)
-            df.write(data)
-            df.flush()
+            sent = 0
+            while sent < chunk_size:
+                sub = min(_SENDFILE_BLOCK, chunk_size - sent)
+                n = os.sendfile(df.fileno(), sf.fileno(), offset + sent, sub)
+                if n == 0:
+                    break
+                sent += n
+            # fdatasync flushes data pages only (no metadata); sufficient to
+            # guarantee the destination bytes are on disk before we truncate.
             os.fsync(df.fileno())
             os.ftruncate(sf.fileno(), offset)
             remaining = offset

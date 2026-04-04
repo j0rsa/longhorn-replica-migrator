@@ -462,7 +462,6 @@ class MigrationScreen(Screen[None]):
     #log_box {
         height: 1fr;
         border: solid $primary;
-        margin: 0 1;
     }
     #btn_migration_cancel {
         margin: 1 1;
@@ -753,13 +752,13 @@ class MigrationScreen(Screen[None]):
 
             # -- Step 8: unmount both ---------------------------------------
             log("[bold][8/8][/bold] Unmounting source and target...")
-            _rc, _out = ops.unmount(src_mp)
+            _, _out = ops.unmount(src_mp)
             if _out:
                 log(f"    {_out}")
             src_mp.rmdir()
             src_mp = None
 
-            _rc, _out = ops.unmount(dst_mp)
+            _, _out = ops.unmount(dst_mp)
             if _out:
                 log(f"    {_out}")
             dst_mp.rmdir()
@@ -823,14 +822,13 @@ class DeflateScreen(Screen[None]):
     }
     #deflate_status {
         padding: 1 2 0 2;
-        height: 3;
+        height: 4;
         background: $surface;
         border-bottom: solid $warning;
     }
     #deflate_log {
         height: 1fr;
         border: solid $warning;
-        margin: 0 1;
     }
     #btn_deflate_back {
         margin: 1 1;
@@ -898,6 +896,8 @@ class DeflateScreen(Screen[None]):
             rc, out, err = kube.run_cmd("kubectl", "version", "--client")
             if out:
                 log(f"    {out}")
+            if err:
+                log(f"    {err}")
             if rc != 0:
                 log("[red]kubectl not available — aborting.[/red]")
                 return

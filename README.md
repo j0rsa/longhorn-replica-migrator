@@ -24,6 +24,8 @@ This tool solves it with **Move + Deflate** mode:
 ### Large-file chunked transfer
 
 Individual files larger than 256 MiB are moved in **512 MiB reverse-order chunks**.
+Each chunk is transferred via `os.sendfile` — a kernel zero-copy path that avoids
+allocating a 512 MiB Python buffer and lets the OS pipeline the I/O efficiently.
 After each chunk is safely written and `fsync`'d to the destination, the
 corresponding tail of the source file is removed via `ftruncate`.  At any point
 during the transfer:
@@ -39,10 +41,14 @@ instead of `2 × total_data` with a standard copy.
 
 Every 100 GiB transferred the tool **pauses, unmounts the source, and deflates it**:
 
-1. Mounts the source block device briefly with `-o discard` and runs `fstrim`.
-   This sends DISCARD/UNMAP commands to the Longhorn engine, which punches holes
-   directly in the backing `.img` sparse files — freeing host disk blocks
-   **without** a temporary space spike.
+1. Mounts the source block device briefly and runs `fstrim -v`.
+   `fstrim` sends DISCARD/UNMAP commands to the Longhorn engine via the FITRIM
+   ioctl, which punches holes directly in the backing `.img` sparse files —
+   freeing host disk blocks **without** a temporary space spike.
+   (The `-o discard` mount option is intentionally **not** used: it triggers
+   real-time TRIM on every delete, which causes FITRIM to return `EBADMSG` on
+   filesystems with prior journal state.  `fstrim` is a batch operation and
+   works correctly with a plain mount.)
 2. Logs how many MiB were freed from the `.img` files.
 3. Remounts and resumes the transfer.
 
