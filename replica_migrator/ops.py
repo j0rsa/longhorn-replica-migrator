@@ -217,21 +217,22 @@ def format_device(device: Path, fs_type: str) -> tuple[int, str]:
     return result.returncode, combined
 
 
-def mount_device(device: Path, mountpoint: Path) -> tuple[int, str]:
+def mount_device(device: Path, mountpoint: Path, extra_opts: str = "") -> tuple[int, str]:
     """Mount a block device at the given mountpoint.
 
     Args:
         device: Path to the block device to mount.
         mountpoint: Directory at which to mount the device.
+        extra_opts: Optional comma-separated mount options (e.g. ``"discard"``).
 
     Returns:
         A 2-tuple of (returncode, combined stdout+stderr).
     """
-    result = subprocess.run(
-        ["mount", str(device), str(mountpoint)],
-        capture_output=True,
-        text=True,
-    )
+    cmd = ["mount"]
+    if extra_opts:
+        cmd += ["-o", extra_opts]
+    cmd += [str(device), str(mountpoint)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     combined = (result.stdout + result.stderr).strip()
     return result.returncode, combined
 
@@ -326,22 +327,33 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0) 
 def deflate_source_imgs(
     replica_path: Path,
     src_device: Path,
-    fs_type: str | None,
+    fs_type: str | None,  # reserved for future per-FS logic
     log: Callable[[str], None],
 ) -> None:
     """Free host disk space used by a Longhorn replica after files have been moved out.
 
     The source block device must be **unmounted** before calling this.
 
-    Steps:
-    1. ``zerofree`` (ext4) or a no-op warning (other FS) — writes actual zero
-       bytes into the free blocks of the block device, which flows through the
-       Longhorn engine into the backing ``.img`` sparse files.
-    2. ``fallocate --dig-holes`` on every ``.img`` file — the kernel detects
-       zero regions and replaces them with sparse holes, which the host OS
-       then releases as free disk blocks.
+    Strategy
+    --------
+    **Do NOT use zerofree.**  The Longhorn ``.img`` files are sparse — filesystem
+    free blocks are already stored as sparse holes (zero host-disk cost).  zerofree
+    writes zeros to those holes, materialising them into real bytes and *increasing*
+    disk usage before fallocate can punch them back.
+
+    Instead:
+
+    1. Mount the device briefly with ``-o discard`` and run ``fstrim``.  This sends
+       DISCARD/UNMAP commands to the Longhorn block device for every free block.
+       The engine punches holes in the ``.img`` files *directly*, with no temporary
+       disk-space spike.
+
+    2. ``fallocate --dig-holes`` on every ``.img`` file to catch any zero regions
+       that fstrim left behind (e.g. blocks the engine zeroed rather than holed).
     """
-    # Show device size so the user can estimate how long zerofree will take.
+    import tempfile
+
+    # Show device size for context.
     size_result = subprocess.run(
         ["blockdev", "--getsize64", str(src_device)], capture_output=True, text=True
     )
@@ -349,15 +361,25 @@ def deflate_source_imgs(
         dev_gib = int(size_result.stdout.strip()) / 1024 ** 3
         log(f"    [deflate] device size: {dev_gib:.1f} GiB")
 
-    if fs_type == "ext4":
-        log("    [deflate] zerofree -v: zeroing free blocks (progress below)...")
-        rc = _stream_cmd(["zerofree", "-v", str(src_device)], log)
-        if rc != 0:
-            log("    [yellow][deflate] zerofree failed — skipping hole punching[/yellow]")
-            return
-    else:
-        log(f"    [yellow][deflate] no zerofree for {fs_type} — hole punching may recover fewer blocks[/yellow]")
+    # Step 1: fstrim via a temporary discard mount.
+    tmp_mp = Path(tempfile.mkdtemp(prefix="lrm-trim-"))
+    try:
+        log("    [deflate] mounting with -o discard for fstrim...")
+        rc_mnt, out_mnt = mount_device(src_device, tmp_mp, extra_opts="discard")
+        if out_mnt:
+            log(f"    {out_mnt}")
+        if rc_mnt != 0:
+            log("    [yellow][deflate] discard mount failed — skipping fstrim[/yellow]")
+        else:
+            log("    [deflate] fstrim: sending DISCARD for all free blocks...")
+            rc_trim = _stream_cmd(["fstrim", "-v", str(tmp_mp)], log)
+            if rc_trim != 0:
+                log("    [yellow][deflate] fstrim failed (DISCARD may not be supported)[/yellow]")
+            unmount(tmp_mp)
+    finally:
+        tmp_mp.rmdir()
 
+    # Step 2: fallocate --dig-holes on every .img file.
     imgs = sorted(replica_path.glob("*.img"))
     log(f"    [deflate] fallocate --dig-holes on {len(imgs)} .img file(s)...")
     for img in imgs:
