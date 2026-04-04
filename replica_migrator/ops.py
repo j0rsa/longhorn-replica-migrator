@@ -49,8 +49,6 @@ def _stream_cmd(cmd: list[str], log: Callable[[str], None]) -> int:
     return proc.returncode or 0
 
 _LARGE_FILE_BYTES = 256 * 1024 * 1024   # 256 MiB — log individually
-_MOVE_CHUNK_BYTES = 512 * 1024 * 1024   # 512 MiB chunks for space-safe large-file moves
-_SENDFILE_BLOCK   = 128 * 1024 * 1024   # 128 MiB per sendfile call (no Python heap alloc)
 _STATE_VERSION = 1
 
 
@@ -86,42 +84,6 @@ def _save_inode_state(state_file: Path, inode_map: dict[int, Path], dst: Path) -
     tmp.write_text(json.dumps(payload))
     tmp.replace(state_file)
 
-
-def _chunked_move_file(src: Path, dst: Path, size: int, log: Callable[[str], None]) -> None:
-    """Move *src* to *dst* in reverse-order 512 MiB chunks.
-
-    After each chunk is safely written and fsynced to the destination,
-    the corresponding tail of the source file is truncated via ftruncate.
-    This keeps peak extra disk usage at one chunk size rather than the
-    full file size.
-    """
-    with open(src, "rb+") as sf, open(dst, "wb") as df:
-        remaining = size
-        while remaining > 0:
-            chunk_size = min(_MOVE_CHUNK_BYTES, remaining)
-            offset = remaining - chunk_size
-            # Stream via sendfile in sub-blocks — no Python heap allocation.
-            # os.sendfile(out_fd, in_fd, in_offset, count) reads from in_offset
-            # in the source and writes at the current position of out_fd.
-            df.seek(offset)
-            sent = 0
-            while sent < chunk_size:
-                sub = min(_SENDFILE_BLOCK, chunk_size - sent)
-                n = os.sendfile(df.fileno(), sf.fileno(), offset + sent, sub)
-                if n == 0:
-                    break
-                sent += n
-            # fdatasync flushes data pages only (no metadata); sufficient to
-            # guarantee the destination bytes are on disk before we truncate.
-            os.fsync(df.fileno())
-            os.ftruncate(sf.fileno(), offset)
-            remaining = offset
-            done_mib = (size - remaining) // 1_048_576
-            total_mib = size // 1_048_576
-            pct = done_mib * 100 // (total_mib or 1)
-            log(f"    {done_mib}/{total_mib} MiB ({pct}%)...")
-    shutil.copystat(src, dst)
-    src.unlink()
 
 
 def build_pod_yaml(
@@ -482,14 +444,9 @@ def move_tree(
             if st.st_nlink > 1 and st.st_ino in inode_map:
                 os.link(inode_map[st.st_ino], dest_file)
                 item.unlink()
-            elif st.st_size >= _LARGE_FILE_BYTES:
-                log(f"    moving large file {item.name} ({st.st_size // 1024 // 1024} MiB)...")
-                _chunked_move_file(item, dest_file, st.st_size, log)
-                if st.st_nlink > 1:
-                    inode_map[st.st_ino] = dest_file
-                    if state_file:
-                        _save_inode_state(state_file, inode_map, dst)
             else:
+                if st.st_size >= _LARGE_FILE_BYTES:
+                    log(f"    moving large file {item.name} ({st.st_size // 1024 // 1024} MiB)...")
                 shutil.move(str(item), str(dest_file))
                 if st.st_nlink > 1:
                     inode_map[st.st_ino] = dest_file

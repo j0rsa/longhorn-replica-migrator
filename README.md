@@ -21,21 +21,21 @@ rarely available on a storage node that is already under pressure.
 
 This tool solves it with **Move + Deflate** mode:
 
-### Large-file chunked transfer
+### Large-file transfer
 
-Individual files larger than 256 MiB are moved in **512 MiB reverse-order chunks**.
-Each chunk is transferred via `os.sendfile` — a kernel zero-copy path that avoids
-allocating a 512 MiB Python buffer and lets the OS pipeline the I/O efficiently.
-After each chunk is safely written and `fsync`'d to the destination, the
-corresponding tail of the source file is removed via `ftruncate`.  At any point
-during the transfer:
+Files are moved directly via `shutil.move` (which uses the kernel `sendfile` path
+on Linux for cross-filesystem moves).  There is no per-chunk `fsync` — the OS
+flushes to the Longhorn block device continuously as writes proceed, without
+stop-and-go stalls.  Peak extra disk usage during a single file transfer equals
+the size of that file; periodic deflation (see below) keeps overall disk usage
+in check between files.
 
 ```
-peak disk usage ≈ source_remaining + destination_written + 512 MiB chunk
-                = total_data  (constant)
+peak disk usage ≈ source_remaining + one_file_size
 ```
 
-instead of `2 × total_data` with a standard copy.
+In practice, the largest files in a Longhorn replica are a few GiB, so the
+exposure between deflation cycles is well within the 100 GiB deflation window.
 
 ### Periodic source deflation
 
