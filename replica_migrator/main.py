@@ -715,13 +715,16 @@ class MigrationScreen(Screen[None]):
                     raise RuntimeError("Failed to remount source after deflation")
 
             try:
+                state_file = cfg.replica.path / ".lrm_inode_state.json"
                 if mode == TransferMode.COPY:
                     ops.copy_tree(src_mp, dst_mp, log, total_files)
                 elif mode == TransferMode.MOVE:
-                    ops.move_tree(src_mp, dst_mp, log, total_files)
+                    ops.move_tree(src_mp, dst_mp, log, total_files,
+                                  state_file=state_file)
                 else:  # MOVE_DEFLATE
                     ops.move_tree(src_mp, dst_mp, log, total_files,
-                                  deflate_every_bytes=_DEFLATE_EVERY, deflate_cb=_do_deflate)
+                                  deflate_every_bytes=_DEFLATE_EVERY, deflate_cb=_do_deflate,
+                                  state_file=state_file)
                 log("    Transfer complete")
             except Exception as exc:
                 log(f"[red][!] Transfer error: {exc}[/red]")

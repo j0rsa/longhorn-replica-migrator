@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -10,6 +11,40 @@ from pathlib import Path
 
 _LARGE_FILE_BYTES = 256 * 1024 * 1024   # 256 MiB — log individually
 _MOVE_CHUNK_BYTES = 512 * 1024 * 1024   # 512 MiB chunks for space-safe large-file moves
+_STATE_VERSION = 1
+
+
+def _load_inode_state(state_file: Path, dst: Path) -> dict[int, Path]:
+    """Load a persisted source-inode → dest-path map from *state_file*.
+
+    Entries whose destination file no longer exists are silently dropped.
+    Returns an empty dict if the file is missing, unreadable, or stale.
+    """
+    if not state_file.exists():
+        return {}
+    try:
+        data: object = json.loads(state_file.read_text())
+        if not isinstance(data, dict) or data.get("version") != _STATE_VERSION:
+            return {}
+        result: dict[int, Path] = {}
+        for ino_str, rel in data.get("inode_map", {}).items():
+            dest = dst / rel
+            if dest.exists():
+                result[int(ino_str)] = dest
+        return result
+    except Exception:
+        return {}
+
+
+def _save_inode_state(state_file: Path, inode_map: dict[int, Path], dst: Path) -> None:
+    """Atomically persist *inode_map* to *state_file*."""
+    payload = {
+        "version": _STATE_VERSION,
+        "inode_map": {str(ino): str(p.relative_to(dst)) for ino, p in inode_map.items()},
+    }
+    tmp = state_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(state_file)
 
 
 def _chunked_move_file(src: Path, dst: Path, size: int, log: Callable[[str], None]) -> None:
@@ -301,6 +336,7 @@ def move_tree(
     total: int = 0,
     deflate_every_bytes: int = 0,
     deflate_cb: Callable[[], None] | None = None,
+    state_file: Path | None = None,
 ) -> None:
     """Recursively move all files from *src* to *dst*, logging progress.
 
@@ -318,7 +354,9 @@ def move_tree(
     """
     count = 0
     errors: list[str] = []
-    inode_map: dict[int, Path] = {}  # source inode → first dest copy
+    inode_map: dict[int, Path] = _load_inode_state(state_file, dst) if state_file else {}
+    if inode_map:
+        log(f"    Resumed with {len(inode_map)} hard-link inode(s) from previous run")
     bytes_since_deflate = 0
     # Pre-collect so we can resume the same list after unmount/remount cycles.
     all_items = sorted(src.rglob("*"), key=lambda p: (len(p.parts), p))
@@ -356,10 +394,14 @@ def move_tree(
                 _chunked_move_file(item, dest_file, st.st_size, log)
                 if st.st_nlink > 1:
                     inode_map[st.st_ino] = dest_file
+                    if state_file:
+                        _save_inode_state(state_file, inode_map, dst)
             else:
                 shutil.move(str(item), str(dest_file))
                 if st.st_nlink > 1:
                     inode_map[st.st_ino] = dest_file
+                    if state_file:
+                        _save_inode_state(state_file, inode_map, dst)
             count += 1
             bytes_since_deflate += st.st_size
         except OSError as exc:
@@ -374,5 +416,7 @@ def move_tree(
             deflate_cb()
             bytes_since_deflate = 0
     log(f"    move_tree: {count} files moved, {len(errors)} errors")
+    if state_file and state_file.exists():
+        state_file.unlink()
     if errors:
         raise RuntimeError(f"{len(errors)} file(s) failed to move")
