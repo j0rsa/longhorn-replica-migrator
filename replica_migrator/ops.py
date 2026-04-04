@@ -9,6 +9,45 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+
+def _stream_cmd(cmd: list[str], log: Callable[[str], None]) -> int:
+    """Run *cmd*, streaming its stdout+stderr to *log* in real time.
+
+    Treats both ``\\n`` and ``\\r`` as line separators so that tools like
+    ``zerofree -v`` that redraw a progress line via carriage-return emit a
+    new log entry for each update rather than going silent.
+
+    Returns the process exit code.
+    """
+    with subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    ) as proc:
+        buf = b""
+        assert proc.stdout is not None
+        while True:
+            chunk = proc.stdout.read(256)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                cr = buf.find(b"\r")
+                nl = buf.find(b"\n")
+                if cr == -1 and nl == -1:
+                    break
+                pos = min(x for x in (cr, nl) if x != -1)
+                line = buf[:pos].decode(errors="replace").strip()
+                buf = buf[pos + 1 :]
+                if line:
+                    log(f"    {line}")
+        if buf:
+            line = buf.decode(errors="replace").strip()
+            if line:
+                log(f"    {line}")
+    return proc.returncode or 0
+
 _LARGE_FILE_BYTES = 256 * 1024 * 1024   # 256 MiB — log individually
 _MOVE_CHUNK_BYTES = 512 * 1024 * 1024   # 512 MiB chunks for space-safe large-file moves
 _STATE_VERSION = 1
@@ -302,29 +341,33 @@ def deflate_source_imgs(
        zero regions and replaces them with sparse holes, which the host OS
        then releases as free disk blocks.
     """
+    # Show device size so the user can estimate how long zerofree will take.
+    size_result = subprocess.run(
+        ["blockdev", "--getsize64", str(src_device)], capture_output=True, text=True
+    )
+    if size_result.returncode == 0:
+        dev_gib = int(size_result.stdout.strip()) / 1024 ** 3
+        log(f"    [deflate] device size: {dev_gib:.1f} GiB")
+
     if fs_type == "ext4":
-        log("    [deflate] zerofree: zeroing free blocks on source device (may take a while)...")
-        result = subprocess.run(["zerofree", str(src_device)], capture_output=True, text=True)
-        out = (result.stdout + result.stderr).strip()
-        if out:
-            log(f"    {out}")
-        if result.returncode != 0:
+        log("    [deflate] zerofree -v: zeroing free blocks (progress below)...")
+        rc = _stream_cmd(["zerofree", "-v", str(src_device)], log)
+        if rc != 0:
             log("    [yellow][deflate] zerofree failed — skipping hole punching[/yellow]")
             return
     else:
-        log(f"    [yellow][deflate] No zerofree for {fs_type} — hole punching may recover fewer blocks[/yellow]")
+        log(f"    [yellow][deflate] no zerofree for {fs_type} — hole punching may recover fewer blocks[/yellow]")
 
     imgs = sorted(replica_path.glob("*.img"))
     log(f"    [deflate] fallocate --dig-holes on {len(imgs)} .img file(s)...")
     for img in imgs:
         before = img.stat().st_blocks * 512
-        result = subprocess.run(["fallocate", "--dig-holes", str(img)], capture_output=True, text=True)
-        out = (result.stdout + result.stderr).strip()
+        rc = _stream_cmd(["fallocate", "--dig-holes", str(img)], log)
         after = img.stat().st_blocks * 512
         freed = (before - after) // 1_048_576
         status = f"freed {freed} MiB" if freed > 0 else "no change"
-        if out:
-            log(f"    {img.name}: {out} ({status})")
+        if rc != 0:
+            log(f"    [yellow]{img.name}: fallocate failed ({status})[/yellow]")
         else:
             log(f"    {img.name}: {status}")
 

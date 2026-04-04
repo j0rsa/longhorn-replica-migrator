@@ -780,6 +780,162 @@ class MigrationScreen(Screen[None]):
 
 
 # ---------------------------------------------------------------------------
+# DeflateScreen
+# ---------------------------------------------------------------------------
+
+
+class DeflateScreen(Screen[None]):
+    """Full-screen log for on-demand source replica deflation.
+
+    Starts a recovery pod to expose the replica block device, runs
+    zerofree + fallocate --dig-holes to reclaim host disk space, then
+    tears the pod down.  No destination disk required.
+    """
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("ctrl+c", "app.quit", "Quit", show=False),
+    ]
+
+    CSS = """
+    DeflateScreen {
+        layout: vertical;
+    }
+    #deflate_status {
+        padding: 1 2 0 2;
+        height: 3;
+        background: $surface;
+        border-bottom: solid $warning;
+    }
+    #deflate_log {
+        height: 1fr;
+        border: solid $warning;
+        margin: 0 1;
+    }
+    #btn_deflate_back {
+        margin: 1 1;
+        width: auto;
+    }
+    """
+
+    class LogLine(Message):
+        def __init__(self, text: str) -> None:
+            super().__init__()
+            self.text = text
+
+    class Done(Message):
+        def __init__(self, success: bool) -> None:
+            super().__init__()
+            self.success = success
+
+    def __init__(self, replica: ReplicaRow, image: str, hostname: str) -> None:
+        super().__init__()
+        self._replica = replica
+        self._image = image
+        self._hostname = hostname
+        self._done = False
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Deflation in progress…", id="deflate_status")
+        yield RichLog(highlight=True, markup=True, id="deflate_log")
+        yield Button("Cancel", id="btn_deflate_back", variant="warning")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._run_deflate()
+
+    def on_deflate_screen_log_line(self, event: DeflateScreen.LogLine) -> None:
+        self.query_one("#deflate_log", RichLog).write(event.text)
+        self.query_one("#deflate_status", Static).update(
+            event.text.replace("[/bold]", "").replace("[bold]", "")
+        )
+
+    def on_deflate_screen_done(self, event: DeflateScreen.Done) -> None:
+        self._done = True
+        btn = self.query_one("#btn_deflate_back", Button)
+        btn.label = "Back"  # type: ignore[assignment]
+        btn.variant = "default"
+        status = self.query_one("#deflate_status", Static)
+        if event.success:
+            status.update("[green bold]Deflation complete[/green bold]")
+        else:
+            status.update("[red bold]Deflation finished with errors — see log[/red bold]")
+
+    @on(Button.Pressed, "#btn_deflate_back")
+    def on_back(self) -> None:
+        if self._done:
+            cast("MigratorApp", self.app).pop_screen()  # type: ignore[misc]
+
+    @work(thread=True)
+    def _run_deflate(self) -> None:
+        def log(text: str) -> None:
+            self.post_message(DeflateScreen.LogLine(text))
+
+        success = False
+        try:
+            log("[bold][pre][/bold] Checking kubectl...")
+            rc, out, err = kube.run_cmd("kubectl", "version", "--client")
+            if out:
+                log(f"    {out}")
+            if rc != 0:
+                log("[red]kubectl not available — aborting.[/red]")
+                return
+
+            vol = self._replica.volume_name if self._replica.volume_name != "—" else self._replica.dir_name
+            src_device = Path("/dev/longhorn") / vol
+
+            phase = kube.pod_phase()
+            if phase is not None:
+                log(f"[yellow][!][/yellow] Stale pod found (phase={phase}), removing...")
+                kube.delete_pod()
+                import time; time.sleep(3)
+
+            yaml_str = ops.build_pod_yaml(
+                self._replica.path, vol,
+                self._replica.size_bytes or 0,
+                self._hostname, self._image,
+            )
+            log(f"[bold][1/4][/bold] Applying recovery pod ({self._image})...")
+            rc, out = kube.apply_yaml(yaml_str)
+            if out:
+                log(f"    {out}")
+            if rc != 0:
+                log("[red]Failed to apply recovery pod — aborting.[/red]")
+                return
+
+            log("[bold][2/4][/bold] Waiting for pod Running (up to 120 s)...")
+            if not kube.wait_pod_running():
+                log("[red]Pod did not reach Running — aborting.[/red]")
+                kube.delete_pod()
+                return
+            log("    Pod is Running")
+
+            log(f"[bold][3/4][/bold] Waiting for device {src_device} (up to 60 s)...")
+            if not kube.wait_device(src_device, 60):
+                log(f"[red]Device {src_device} did not appear — aborting.[/red]")
+                kube.delete_pod()
+                return
+            log(f"    Device {src_device} is ready")
+
+            src_fs = ops.detect_fs_type(src_device)
+            log(f"    Filesystem: {src_fs or 'unknown'}")
+            log("[bold][4/4][/bold] Deflating...")
+            ops.deflate_source_imgs(self._replica.path, src_device, src_fs, log)
+
+            log("Deleting recovery pod...")
+            kube.delete_pod()
+            log("[green bold]✓ Deflation complete[/green bold]")
+            success = True
+
+        except Exception as exc:
+            log(f"[red][!] Unexpected error: {exc}[/red]")
+            with contextlib.suppress(Exception):
+                kube.delete_pod()
+        finally:
+            self.post_message(DeflateScreen.Done(success))
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -841,6 +997,7 @@ class MigratorApp(App[None]):
         Binding("1", "select_replica", "Source replica", show=True),
         Binding("2", "select_disk", "Destination disk", show=True),
         Binding("3", "run_migration", "Run migration", show=True),
+        Binding("4", "deflate_source", "Deflate source", show=True),
         Binding("q", "quit", "Quit", show=True),
         Binding("й", "quit", "Quit", show=False),
         Binding("ctrl+c", "quit", "Quit", show=False),
@@ -885,6 +1042,13 @@ class MigratorApp(App[None]):
                     variant="success",
                     disabled=True,
                 )
+                yield Button(
+                    "4 · Deflate source replica",
+                    id="btn_deflate",
+                    classes="menu_btn",
+                    variant="warning",
+                    disabled=True,
+                )
                 yield Button("Quit", id="btn_quit", classes="menu_btn", variant="error")
         yield Footer()
 
@@ -912,6 +1076,7 @@ class MigratorApp(App[None]):
             block += "  [dim](none selected)[/dim]\n"
         self.query_one("#summary", Static).update(block)
         self.query_one("#btn_run_migration", Button).disabled = not (self.selected_replica and self.selected_disk)
+        self.query_one("#btn_deflate", Button).disabled = not self.selected_replica
 
     def action_select_replica(self) -> None:
         """Open the replica picker via keyboard shortcut."""
@@ -924,6 +1089,16 @@ class MigratorApp(App[None]):
     def action_run_migration(self) -> None:
         """Open the config screen via keyboard shortcut."""
         self.open_config_screen()
+
+    def action_deflate_source(self) -> None:
+        """Open the deflate screen via keyboard shortcut."""
+        if self.selected_replica is None:
+            return
+        self.push_screen(DeflateScreen(
+            replica=self.selected_replica,
+            image=DEFAULT_IMAGE,
+            hostname=kube.get_hostname(),
+        ))
 
     @on(Button.Pressed, "#btn_replica")
     def open_replica_picker(self) -> None:
@@ -973,6 +1148,17 @@ class MigratorApp(App[None]):
         """
         if result is not None:
             self.push_screen(MigrationScreen(result))
+
+    @on(Button.Pressed, "#btn_deflate")
+    def open_deflate_screen(self) -> None:
+        """Open the deflation screen for the selected source replica."""
+        if self.selected_replica is None:
+            return
+        self.push_screen(DeflateScreen(
+            replica=self.selected_replica,
+            image=DEFAULT_IMAGE,
+            hostname=kube.get_hostname(),
+        ))
 
     @on(Button.Pressed, "#btn_quit")
     def quit_btn(self) -> None:
