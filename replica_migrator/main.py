@@ -737,7 +737,8 @@ class MigrationScreen(Screen[None]):
                 ops.sync_fs(src_mp)
                 log("[bold][deflate][/bold] Unmounting source for deflation...")
                 ops.unmount(src_mp)
-                ops.deflate_source_imgs(cfg.replica.path, src_device, src_fs, log)
+                if not ops.deflate_source_imgs(cfg.replica.path, src_device, src_fs, log):
+                    log("[yellow][deflate] no space freed — DISCARD not supported on this engine version[/yellow]")
                 log("[bold][deflate][/bold] Remounting source, resuming transfer...")
                 rc_d, out_d = ops.mount_device(src_device, src_mp)
                 if out_d:
@@ -1001,12 +1002,16 @@ class DeflateScreen(Screen[None]):
             src_fs = ops.detect_fs_type(src_device)
             log(f"    Filesystem: {src_fs or 'unknown'}")
             log("[bold][4/4][/bold] Deflating...")
-            ops.deflate_source_imgs(self._replica.path, src_device, src_fs, log)
+            freed = ops.deflate_source_imgs(self._replica.path, src_device, src_fs, log)
 
             log("Deleting recovery pod...")
             kube.delete_pod()
-            log("[green bold]✓ Deflation complete[/green bold]")
-            success = True
+            if freed:
+                log("[green bold]✓ Deflation complete[/green bold]")
+                success = True
+            else:
+                log("[yellow bold]⚠ Deflation finished but no space was freed — DISCARD not supported on this engine version[/yellow bold]")
+                success = False
 
         except Exception as exc:
             log(f"[red][!] Unexpected error: {exc}[/red]")

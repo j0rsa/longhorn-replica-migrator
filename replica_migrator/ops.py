@@ -318,32 +318,39 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0,
         raise RuntimeError(f"{len(errors)} file(s) failed to copy")
 
 
+def _device_supports_discard(device: Path) -> bool:
+    """Return True if *device* advertises DISCARD/UNMAP support via sysfs."""
+    try:
+        real = Path(device).resolve()
+        gran = Path(f"/sys/block/{real.name}/queue/discard_granularity").read_text().strip()
+        return int(gran) > 0
+    except Exception:
+        return True  # can't tell — let fstrim try
+
+
 def deflate_source_imgs(
     replica_path: Path,
     src_device: Path,
     fs_type: str | None,  # reserved for future per-FS logic
     log: Callable[[str], None],
-) -> None:
+) -> bool:
     """Free host disk space used by a Longhorn replica after files have been moved out.
 
     The source block device must be **unmounted** before calling this.
 
+    Returns True if fstrim freed at least some space, False otherwise.
+
     Strategy
     --------
-    **Do NOT use zerofree.**  The Longhorn ``.img`` files are sparse — filesystem
-    free blocks are already stored as sparse holes (zero host-disk cost).  zerofree
-    writes zeros to those holes, materialising them into real bytes and *increasing*
-    disk usage before fallocate can punch them back.
+    Mounts the device briefly and runs ``fstrim -v``.  fstrim sends FITRIM ioctl
+    which the Longhorn engine handles by punching holes directly in the backing
+    ``.img`` sparse files — freeing host disk blocks without a space spike.
 
-    Instead:
-
-    1. Mount the device briefly with ``-o discard`` and run ``fstrim``.  This sends
-       DISCARD/UNMAP commands to the Longhorn block device for every free block.
-       The engine punches holes in the ``.img`` files *directly*, with no temporary
-       disk-space spike.
-
-    2. ``fallocate --dig-holes`` on every ``.img`` file to catch any zero regions
-       that fstrim left behind (e.g. blocks the engine zeroed rather than holed).
+    **Requires DISCARD support** in the block device.  ``launch-simple-longhorn``
+    (the recovery-pod engine) may not advertise DISCARD on all engine versions.
+    If DISCARD is not supported the FITRIM ioctl returns EBADMSG and nothing is
+    freed.  Check ``/sys/block/<dev>/queue/discard_granularity`` — a value of 0
+    means the device does not support DISCARD.
     """
     import tempfile
 
@@ -355,20 +362,25 @@ def deflate_source_imgs(
         dev_gib = int(size_result.stdout.strip()) / 1024 ** 3
         log(f"    [deflate] device size: {dev_gib:.1f} GiB")
 
-    # Snapshot .img disk usage before fstrim so we can decide whether
-    # fallocate is worth running afterwards.
+    # Check DISCARD support before mounting — avoids a confusing EBADMSG.
+    if not _device_supports_discard(src_device):
+        log(
+            "    [yellow][deflate] device does not advertise DISCARD support "
+            "(discard_granularity=0 in sysfs).  launch-simple-longhorn may not "
+            "implement DISCARD/UNMAP on this engine version — fstrim will not "
+            "free space.[/yellow]"
+        )
+        return False
+
     def _img_blocks() -> int:
         return sum(img.stat().st_blocks for img in replica_path.glob("*.img"))
 
     before_blocks = _img_blocks()
 
-    # Step 1: fstrim via a temporary mount.
-    # Note: fstrim does NOT require the filesystem to be mounted with -o discard.
-    # The discard mount option enables real-time per-deletion TRIM; fstrim is a
-    # batch operation that sends FITRIM ioctl independently of mount options.
-    # Mounting with -o discard on a filesystem that has prior journal state causes
-    # FITRIM to return EBADMSG ("Bad message"), so we use a plain mount here.
-    fstrim_ok = False
+    # fstrim via a temporary plain mount (not -o discard — that mount option
+    # enables real-time per-deletion TRIM and causes FITRIM to return EBADMSG
+    # on filesystems with prior journal state).
+    freed_mib = 0
     tmp_mp = Path(tempfile.mkdtemp(prefix="lrm-trim-"))
     try:
         log("    [deflate] mounting source for fstrim...")
@@ -380,16 +392,21 @@ def deflate_source_imgs(
         else:
             log("    [deflate] fstrim: sending DISCARD for all free blocks...")
             rc_trim = _stream_cmd(["fstrim", "-v", str(tmp_mp)], log)
-            fstrim_ok = rc_trim == 0
-            if not fstrim_ok:
-                log("    [yellow][deflate] fstrim failed (DISCARD may not be supported by this Longhorn engine version)[/yellow]")
+            if rc_trim != 0:
+                log(
+                    "    [yellow][deflate] fstrim failed — DISCARD may not be "
+                    "supported by this engine version (FITRIM EBADMSG).  "
+                    "Try engine image longhornio/longhorn-engine:v1.6.x or earlier "
+                    "which is known to support DISCARD in launch-simple-longhorn.[/yellow]"
+                )
             unmount(tmp_mp)
     finally:
         tmp_mp.rmdir()
 
-    after_fstrim_blocks = _img_blocks()
-    freed_by_fstrim = (before_blocks - after_fstrim_blocks) * 512 // 1_048_576
-    log(f"    [deflate] fstrim freed {freed_by_fstrim} MiB from .img files")
+    after_blocks = _img_blocks()
+    freed_mib = (before_blocks - after_blocks) * 512 // 1_048_576
+    log(f"    [deflate] fstrim freed {freed_mib} MiB from .img files")
+    return freed_mib > 0
 
 
 def move_tree(
