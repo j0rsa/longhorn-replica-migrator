@@ -5,6 +5,7 @@ from __future__ import annotations
 import socket
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 DEFAULT_IMAGE: str = "longhornio/longhorn-engine:v1.11.0"
@@ -111,6 +112,7 @@ def wait_pod_running(
     name: str = POD_NAME,
     namespace: str = POD_NAMESPACE,
     timeout: int = 120,
+    cancelled: Callable[[], bool] | None = None,
 ) -> bool:
     """Poll until the pod reaches the ``Running`` phase or a timeout expires.
 
@@ -118,12 +120,15 @@ def wait_pod_running(
         name: Pod name to wait for.
         namespace: Namespace containing the pod.
         timeout: Maximum seconds to wait before giving up.
+        cancelled: Optional callable; if it returns True the wait is aborted.
 
     Returns:
         ``True`` if the pod reached ``Running`` within the timeout, else ``False``.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if cancelled and cancelled():
+            return False
         phase = pod_phase(name, namespace)
         if phase == "Running":
             return True
@@ -131,18 +136,22 @@ def wait_pod_running(
     return False
 
 
-def wait_device(device: Path, timeout: int = 60) -> bool:
+def wait_device(device: Path, timeout: int = 60,
+                cancelled: Callable[[], bool] | None = None) -> bool:
     """Poll until a block device path exists on the filesystem.
 
     Args:
         device: Path to the expected device (e.g. ``/dev/longhorn/my-vol``).
         timeout: Maximum seconds to wait before giving up.
+        cancelled: Optional callable; if it returns True the wait is aborted.
 
     Returns:
         ``True`` if the device appeared within the timeout, else ``False``.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if cancelled and cancelled():
+            return False
         if device.exists():
             return True
         time.sleep(_POLL_INTERVAL)

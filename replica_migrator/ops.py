@@ -54,6 +54,10 @@ _LARGE_FILE_BYTES = 256 * 1024 * 1024   # 256 MiB — log individually
 _STATE_VERSION = 1
 
 
+class Cancelled(Exception):
+    """Raised by transfer functions when the *cancelled* callback returns True."""
+
+
 def _load_inode_state(state_file: Path, dst: Path) -> dict[int, Path]:
     """Load a persisted source-inode → dest-path map from *state_file*.
 
@@ -249,7 +253,8 @@ def count_files(path: Path) -> int:
 
 
 def copy_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0,
-              progress_cb: Callable[[int, int], None] | None = None) -> None:
+              progress_cb: Callable[[int, int], None] | None = None,
+              cancelled: Callable[[], bool] | None = None) -> None:
     """Recursively copy all files from *src* to *dst*, logging progress.
 
     Symlinks are recreated as symlinks (not followed).  Per-file errors are
@@ -267,6 +272,8 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0,
     errors: list[str] = []
     inode_map: dict[int, Path] = {}  # source inode → first dest copy
     for item in src.rglob("*"):
+        if cancelled and cancelled():
+            raise Cancelled()
         if item.is_symlink():
             relative = item.relative_to(src)
             dest_link = dst / relative
@@ -395,6 +402,7 @@ def move_tree(
     state_file: Path | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     workers: int = 4,
+    cancelled: Callable[[], bool] | None = None,
 ) -> None:
     """Recursively move all files from *src* to *dst*, logging progress.
 
@@ -445,7 +453,55 @@ def move_tree(
         file_items.append(item)
 
     # ------------------------------------------------------------------
-    # Phase 2: pre-stat all files; group hard-linked files by inode.
+    # Phase 2a: destination-side hard-link scan.
+    #
+    # Walk the destination for files with nlink > 1 (already hard-linked
+    # on dst, meaning both the original and its link were moved in a
+    # previous run).  Any corresponding source path that still exists can
+    # be unlinked immediately — its data is already on the destination and
+    # accessible via one of the dst hard links.  This frees source blocks
+    # before the first batch and before the first deflation cycle.
+    #
+    # This complements the source-side pre-scan below: that scan handles
+    # cases where the source still shows nlink > 1; this scan handles the
+    # case where the source link count dropped to 1 after a partial run
+    # (so the source-side scan would miss it).
+    # ------------------------------------------------------------------
+    log("    Scanning destination for already-transferred hard-link groups...")
+    dst_ino_groups: defaultdict[int, list[Path]] = defaultdict(list)
+    for dst_item in dst.rglob("*"):
+        if dst_item.is_symlink() or dst_item.is_dir():
+            continue
+        try:
+            st = dst_item.stat()
+            if st.st_nlink > 1:
+                dst_ino_groups[st.st_ino].append(dst_item.relative_to(dst))
+        except OSError:
+            pass
+
+    dst_freed = 0
+    dst_freed_bytes = 0
+    for relpaths in dst_ino_groups.values():
+        for rel in relpaths:
+            src_path = src / rel
+            if src_path.exists() and not src_path.is_symlink():
+                try:
+                    dst_freed_bytes += src_path.stat().st_size
+                    src_path.unlink()
+                    dst_freed += 1
+                    count += 1
+                    if progress_cb:
+                        progress_cb(count, total)
+                except OSError as exc:
+                    log(f"    [yellow][!] could not free {src_path}: {exc}[/yellow]")
+
+    if dst_freed:
+        log(f"    [resume] freed {dst_freed} source file(s) already on destination ({dst_freed_bytes // 1_048_576} MiB freed)")
+    else:
+        log("    No resumable hard-link groups found on destination")
+
+    # ------------------------------------------------------------------
+    # Phase 2b: pre-stat all files; group hard-linked files by inode.
     #
     # For each inode group:
     #   • If the inode is already in inode_map (resumed run), all paths are
@@ -610,6 +666,10 @@ def move_tree(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_move_one, item): item for item in batch}
             for future in as_completed(futures):
+                if cancelled and cancelled():
+                    for f in futures:
+                        f.cancel()
+                    raise Cancelled()
                 src_item = futures[future]
                 try:
                     moved_item, size = future.result()

@@ -7,6 +7,7 @@ import contextlib
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import ClassVar, cast
@@ -446,7 +447,8 @@ class MigrationScreen(Screen[None]):
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("ctrl+c", "app.quit", "Quit", show=False),
+        Binding("ctrl+c", "interrupt_or_quit", "Interrupt", show=False),
+        Binding("q", "interrupt_or_quit", "Interrupt", show=False),
     ]
 
     CSS = """
@@ -517,13 +519,14 @@ class MigrationScreen(Screen[None]):
         super().__init__()
         self._config = config
         self._done = False
+        self._stop = threading.Event()
 
     def compose(self) -> ComposeResult:
         """Build the migration progress UI."""
         yield Header()
         yield Static("Migration in progress…", id="status_line")
         yield RichLog(highlight=True, markup=True, id="log_box")
-        yield Button("Cancel / Cleanup", id="btn_migration_cancel", variant="warning")
+        yield Button("Interrupt", id="btn_migration_cancel", variant="error")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -537,29 +540,46 @@ class MigrationScreen(Screen[None]):
         self.query_one("#status_line", Static).update(event.text)
 
     def on_migration_screen_done(self, event: MigrationScreen.Done) -> None:
-        """Handle migration completion — update button and status.
-
-        Args:
-            event: The done message.
-        """
+        """Handle migration completion — update button and status."""
         self._done = True
         btn = self.query_one("#btn_migration_cancel", Button)
         btn.label = "Back"  # type: ignore[assignment]
         btn.variant = "default"
+        btn.disabled = False
         status = self.query_one("#status_line", Static)
         if event.success:
             status.update("[green bold]Migration complete[/green bold]")
+        elif self._stop.is_set():
+            status.update("[yellow bold]Migration interrupted — mounts cleaned up[/yellow bold]")
         else:
             status.update("[red bold]Migration finished with errors — see log above[/red bold]")
 
-    @on(Button.Pressed, "#btn_migration_cancel")
-    def on_cancel_or_back(self) -> None:
-        """Pop this screen when migration is done, or attempt cancellation."""
+    def action_interrupt_or_quit(self) -> None:
+        """Interrupt the running migration, or go back if already done."""
         if self._done:
             cast("MigratorApp", self.app).pop_screen()  # type: ignore[misc]
         else:
-            log_box = self.query_one("#log_box", RichLog)
-            log_box.write("[yellow][!] Cancellation not supported while migration is running.[/yellow]")
+            self._request_interrupt()
+
+    def _request_interrupt(self) -> None:
+        """Signal the worker to stop after the current file and clean up."""
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        btn = self.query_one("#btn_migration_cancel", Button)
+        btn.label = "Interrupting…"  # type: ignore[assignment]
+        btn.disabled = True
+        self.query_one("#log_box", RichLog).write(
+            "[yellow]⚠ Interrupt requested — finishing current file, then unmounting and deleting pod...[/yellow]"
+        )
+
+    @on(Button.Pressed, "#btn_migration_cancel")
+    def on_cancel_or_back(self) -> None:
+        """Interrupt migration or go back when done."""
+        if self._done:
+            cast("MigratorApp", self.app).pop_screen()  # type: ignore[misc]
+        else:
+            self._request_interrupt()
 
     @work(thread=True)
     def _start_migration(self) -> None:
@@ -627,7 +647,7 @@ class MigrationScreen(Screen[None]):
             # -- Step 4: wait for pod Running -------------------------------
             status("[4/8] Waiting for pod Running...")
             log("[bold][4/8][/bold] Waiting for pod Running (up to 120 s)...")
-            ok = kube.wait_pod_running()
+            ok = kube.wait_pod_running(cancelled=self._stop.is_set)
             if not ok:
                 log("[red]Pod did not reach Running state in time — aborting.[/red]")
                 kube.delete_pod()
@@ -637,7 +657,7 @@ class MigrationScreen(Screen[None]):
             # -- Step 5: wait for source device -----------------------------
             status(f"[5/8] Waiting for device {src_device}...")
             log(f"[bold][5/8][/bold] Waiting for source device {src_device} (up to 60 s)...")
-            ok = kube.wait_device(src_device, 60)
+            ok = kube.wait_device(src_device, 60, cancelled=self._stop.is_set)
             if not ok:
                 log(f"[red]Device {src_device} did not appear in time — aborting.[/red]")
                 kube.delete_pod()
@@ -737,15 +757,20 @@ class MigrationScreen(Screen[None]):
                 state_file = cfg.replica.path / ".lrm_inode_state.json"
                 if mode == TransferMode.COPY:
                     ops.copy_tree(src_mp, dst_mp, log, total_files,
-                                  progress_cb=_progress)
+                                  progress_cb=_progress, cancelled=self._stop.is_set)
                 elif mode == TransferMode.MOVE:
                     ops.move_tree(src_mp, dst_mp, log, total_files,
-                                  state_file=state_file, progress_cb=_progress)
+                                  state_file=state_file, progress_cb=_progress,
+                                  cancelled=self._stop.is_set)
                 else:  # MOVE_DEFLATE
                     ops.move_tree(src_mp, dst_mp, log, total_files,
                                   deflate_every_bytes=_DEFLATE_EVERY, deflate_cb=_do_deflate,
-                                  state_file=state_file, progress_cb=_progress)
+                                  state_file=state_file, progress_cb=_progress,
+                                  cancelled=self._stop.is_set)
                 log("    Transfer complete")
+            except ops.Cancelled:
+                log("[yellow]⚠ Transfer interrupted by user[/yellow]")
+                transfer_ok = False
             except Exception as exc:
                 log(f"[red][!] Transfer error: {exc}[/red]")
                 transfer_ok = False
@@ -813,7 +838,8 @@ class DeflateScreen(Screen[None]):
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("ctrl+c", "app.quit", "Quit", show=False),
+        Binding("ctrl+c", "interrupt_or_quit", "Interrupt", show=False),
+        Binding("q", "interrupt_or_quit", "Interrupt", show=False),
     ]
 
     CSS = """
@@ -852,12 +878,13 @@ class DeflateScreen(Screen[None]):
         self._image = image
         self._hostname = hostname
         self._done = False
+        self._stop = threading.Event()
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("Deflation in progress…", id="deflate_status")
         yield RichLog(highlight=True, markup=True, id="deflate_log")
-        yield Button("Cancel", id="btn_deflate_back", variant="warning")
+        yield Button("Interrupt", id="btn_deflate_back", variant="error")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -874,16 +901,38 @@ class DeflateScreen(Screen[None]):
         btn = self.query_one("#btn_deflate_back", Button)
         btn.label = "Back"  # type: ignore[assignment]
         btn.variant = "default"
+        btn.disabled = False
         status = self.query_one("#deflate_status", Static)
         if event.success:
             status.update("[green bold]Deflation complete[/green bold]")
+        elif self._stop.is_set():
+            status.update("[yellow bold]Deflation interrupted — pod cleaned up[/yellow bold]")
         else:
             status.update("[red bold]Deflation finished with errors — see log[/red bold]")
+
+    def action_interrupt_or_quit(self) -> None:
+        if self._done:
+            cast("MigratorApp", self.app).pop_screen()  # type: ignore[misc]
+        else:
+            self._request_interrupt()
+
+    def _request_interrupt(self) -> None:
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        btn = self.query_one("#btn_deflate_back", Button)
+        btn.label = "Interrupting…"  # type: ignore[assignment]
+        btn.disabled = True
+        self.query_one("#deflate_log", RichLog).write(
+            "[yellow]⚠ Interrupt requested — waiting for current step to finish, then deleting pod...[/yellow]"
+        )
 
     @on(Button.Pressed, "#btn_deflate_back")
     def on_back(self) -> None:
         if self._done:
             cast("MigratorApp", self.app).pop_screen()  # type: ignore[misc]
+        else:
+            self._request_interrupt()
 
     @work(thread=True)
     def _run_deflate(self) -> None:
@@ -925,15 +974,26 @@ class DeflateScreen(Screen[None]):
                 return
 
             log("[bold][2/4][/bold] Waiting for pod Running (up to 120 s)...")
-            if not kube.wait_pod_running():
-                log("[red]Pod did not reach Running — aborting.[/red]")
+            if not kube.wait_pod_running(cancelled=self._stop.is_set):
+                if self._stop.is_set():
+                    log("[yellow]Interrupted — deleting pod.[/yellow]")
+                else:
+                    log("[red]Pod did not reach Running — aborting.[/red]")
                 kube.delete_pod()
                 return
             log("    Pod is Running")
 
+            if self._stop.is_set():
+                log("[yellow]Interrupted — deleting pod.[/yellow]")
+                kube.delete_pod()
+                return
+
             log(f"[bold][3/4][/bold] Waiting for device {src_device} (up to 60 s)...")
-            if not kube.wait_device(src_device, 60):
-                log(f"[red]Device {src_device} did not appear — aborting.[/red]")
+            if not kube.wait_device(src_device, 60, cancelled=self._stop.is_set):
+                if self._stop.is_set():
+                    log("[yellow]Interrupted — deleting pod.[/yellow]")
+                else:
+                    log(f"[red]Device {src_device} did not appear — aborting.[/red]")
                 kube.delete_pod()
                 return
             log(f"    Device {src_device} is ready")
