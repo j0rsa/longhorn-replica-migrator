@@ -480,6 +480,8 @@ def move_tree(
     # and before the first deflation cycle.
     # ------------------------------------------------------------------
     prescan_completed = 0
+    if inode_paths:
+        log(f"    Pre-scanning {len(inode_paths)} hard-link inode group(s) against destination...")
     for ino, paths in inode_paths.items():
         if ino in inode_map:
             continue
