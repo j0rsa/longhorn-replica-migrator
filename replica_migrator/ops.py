@@ -468,6 +468,50 @@ def move_tree(
         except OSError:
             pass
 
+    # ------------------------------------------------------------------
+    # Pre-scan: detect partially-transferred hard-link groups.
+    #
+    # If ANY destination path already exists for a given inode (from a
+    # previous interrupted run), we can complete the whole group right
+    # now without re-transferring data:
+    #   • create hard links on dst for every missing path in the group
+    #   • unlink every remaining source path for that inode
+    # This frees the source blocks immediately, before the first batch
+    # and before the first deflation cycle.
+    # ------------------------------------------------------------------
+    prescan_completed = 0
+    for ino, paths in inode_paths.items():
+        if ino in inode_map:
+            continue
+        dest_existing: Path | None = next(
+            (dst / p.relative_to(src) for p in paths
+             if (dst / p.relative_to(src)).exists()),
+            None,
+        )
+        if dest_existing is None:
+            continue
+        inode_map[ino] = dest_existing
+        if state_file:
+            _save_inode_state(state_file, inode_map, dst)
+        for path in paths:
+            dest_path = dst / path.relative_to(src)
+            try:
+                if not dest_path.exists():
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    os.link(dest_existing, dest_path)
+                if not path.is_symlink() and path.exists():
+                    path.unlink()
+                count += 1
+                prescan_completed += 1
+                if progress_cb:
+                    progress_cb(count, total)
+            except OSError as exc:
+                msg = f"{path}: {exc}"
+                log(f"    [red][!] failed pre-scan link {msg}[/red]")
+                errors.append(msg)
+    if prescan_completed:
+        log(f"    [resume] completed {prescan_completed} hard-link path(s) from previous run — source blocks freed")
+
     # first_of_inode: inode → path to actually move (data transfer)
     # extras_of_inode: inode → remaining paths to hard-link after first moves
     first_of_inode: dict[int, Path] = {}
