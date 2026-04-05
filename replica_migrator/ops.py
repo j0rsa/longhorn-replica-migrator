@@ -318,14 +318,36 @@ def copy_tree(src: Path, dst: Path, log: Callable[[str], None], total: int = 0,
         raise RuntimeError(f"{len(errors)} file(s) failed to copy")
 
 
-def _device_supports_discard(device: Path) -> bool:
-    """Return True if *device* advertises DISCARD/UNMAP support via sysfs."""
+def _ensure_discard_enabled(device: Path, log: Callable[[str], None]) -> None:
+    """Ensure the block device's SCSI provisioning mode is set to 'unmap'.
+
+    ``launch-simple-longhorn`` uses an iSCSI/TGT frontend with
+    ``thin_provisioning=1``, so the *target* always advertises UNMAP support.
+    However the Linux SCSI initiator layer defaults ``provisioning_mode`` to
+    ``full`` (no UNMAP) unless told otherwise.  With ``full``, FITRIM returns
+    EBADMSG even though the target supports it.
+
+    Setting ``provisioning_mode`` to ``unmap`` via sysfs tells the initiator
+    to use UNMAP commands, which Longhorn then converts to
+    ``fallocate(PUNCH_HOLE)`` calls on the ``.img`` files.
+    """
     try:
-        real = Path(device).resolve()
-        gran = Path(f"/sys/block/{real.name}/queue/discard_granularity").read_text().strip()
-        return int(gran) > 0
-    except Exception:
-        return True  # can't tell — let fstrim try
+        real = device.resolve()
+        dev_name = real.name  # e.g. sdc, sdd
+        prov_paths = list(
+            Path(f"/sys/block/{dev_name}/device/scsi_disk").glob("*/provisioning_mode")
+        )
+        if not prov_paths:
+            return  # not a SCSI device — nothing to do
+        prov_path = prov_paths[0]
+        current = prov_path.read_text().strip()
+        if current == "unmap":
+            log(f"    [deflate] SCSI provisioning_mode already 'unmap' ({prov_path})")
+            return
+        log(f"    [deflate] setting provisioning_mode: {current!r} → 'unmap' ({prov_path})")
+        prov_path.write_text("unmap\n")
+    except Exception as exc:
+        log(f"    [yellow][deflate] could not set provisioning_mode: {exc}[/yellow]")
 
 
 def deflate_source_imgs(
@@ -362,24 +384,20 @@ def deflate_source_imgs(
         dev_gib = int(size_result.stdout.strip()) / 1024 ** 3
         log(f"    [deflate] device size: {dev_gib:.1f} GiB")
 
-    # Check DISCARD support before mounting — avoids a confusing EBADMSG.
-    if not _device_supports_discard(src_device):
-        log(
-            "    [yellow][deflate] device does not advertise DISCARD support "
-            "(discard_granularity=0 in sysfs).  launch-simple-longhorn may not "
-            "implement DISCARD/UNMAP on this engine version — fstrim will not "
-            "free space.[/yellow]"
-        )
-        return False
+    # launch-simple-longhorn uses iSCSI/TGT with thin_provisioning=1, so the
+    # target always supports UNMAP.  However the Linux SCSI initiator defaults
+    # provisioning_mode to 'full' (no UNMAP) — set it to 'unmap' so the kernel
+    # sends UNMAP commands that Longhorn converts to fallocate(PUNCH_HOLE).
+    _ensure_discard_enabled(src_device, log)
 
     def _img_blocks() -> int:
         return sum(img.stat().st_blocks for img in replica_path.glob("*.img"))
 
     before_blocks = _img_blocks()
 
-    # fstrim via a temporary plain mount (not -o discard — that mount option
-    # enables real-time per-deletion TRIM and causes FITRIM to return EBADMSG
-    # on filesystems with prior journal state).
+    # Plain mount (not -o discard) — the discard mount option enables real-time
+    # per-deletion TRIM and causes FITRIM to return EBADMSG on filesystems with
+    # prior journal state.  fstrim is a batch operation and works fine without it.
     freed_mib = 0
     tmp_mp = Path(tempfile.mkdtemp(prefix="lrm-trim-"))
     try:
@@ -394,10 +412,9 @@ def deflate_source_imgs(
             rc_trim = _stream_cmd(["fstrim", "-v", str(tmp_mp)], log)
             if rc_trim != 0:
                 log(
-                    "    [yellow][deflate] fstrim failed — DISCARD may not be "
-                    "supported by this engine version (FITRIM EBADMSG).  "
-                    "Try engine image longhornio/longhorn-engine:v1.6.x or earlier "
-                    "which is known to support DISCARD in launch-simple-longhorn.[/yellow]"
+                    "    [yellow][deflate] fstrim failed (FITRIM EBADMSG).  "
+                    "provisioning_mode may not have taken effect — check "
+                    "/sys/block/<dev>/device/scsi_disk/*/provisioning_mode[/yellow]"
                 )
             unmount(tmp_mp)
     finally:
