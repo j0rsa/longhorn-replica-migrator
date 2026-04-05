@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -397,14 +398,13 @@ def move_tree(
 ) -> None:
     """Recursively move all files from *src* to *dst*, logging progress.
 
-    Regular files are moved in parallel using *workers* threads.  Hard-linked
-    files (nlink > 1) are processed sequentially to preserve inode_map
-    correctness without locking around the inode check + move pair.
+    Hard-linked files (nlink > 1) are split by inode: the *first* occurrence
+    joins the regular-file parallel batch for that deflation cycle so its data
+    is freed before ``fstrim`` runs.  Extra occurrences are linked sequentially
+    immediately after each batch completes, still within the same cycle.
 
-    When *deflate_every_bytes* is set, regular files are grouped into batches
-    no larger than that threshold.  Deflation is triggered between batches —
-    never mid-batch — so the source filesystem is always fully unmounted while
-    workers are idle.
+    Deflation fires between batches — never mid-batch — so the source
+    filesystem is always unmounted while workers are idle.
 
     Raises:
         RuntimeError: If one or more files could not be moved.
@@ -445,44 +445,130 @@ def move_tree(
         file_items.append(item)
 
     # ------------------------------------------------------------------
-    # Phase 2: separate hard-linked from regular files
-    # Hard-linked files (nlink > 1) need sequential processing so that the
-    # first occurrence is moved and later occurrences become hard links
-    # without a TOCTOU race on inode_map.
+    # Phase 2: pre-stat all files; group hard-linked files by inode.
+    #
+    # For each inode group:
+    #   • If the inode is already in inode_map (resumed run), all paths are
+    #     "extras" — just create hard links, no data to move.
+    #   • Otherwise the first path is the "move candidate" (treated like a
+    #     regular file in the parallel batch); remaining paths are "extras"
+    #     to be linked after the batch that moved the first occurrence.
+    #
+    # This ensures every inode's data is freed from the source *before*
+    # fstrim runs in the same deflation cycle.
     # ------------------------------------------------------------------
-    regular: list[Path] = []
-    hardlinked: list[Path] = []
+    item_stats: dict[Path, os.stat_result] = {}
+    inode_paths: defaultdict[int, list[Path]] = defaultdict(list)
     for item in file_items:
         try:
-            (hardlinked if item.stat().st_nlink > 1 else regular).append(item)
+            st = item.stat()
+            item_stats[item] = st
+            if st.st_nlink > 1:
+                inode_paths[st.st_ino].append(item)
         except OSError:
-            regular.append(item)  # will fail gracefully in worker
+            pass
+
+    # first_of_inode: inode → path to actually move (data transfer)
+    # extras_of_inode: inode → remaining paths to hard-link after first moves
+    first_of_inode: dict[int, Path] = {}
+    extras_of_inode: defaultdict[int, list[Path]] = defaultdict(list)
+    for ino, paths in inode_paths.items():
+        if ino in inode_map:
+            extras_of_inode[ino].extend(paths)
+        else:
+            first_of_inode[ino] = paths[0]
+            extras_of_inode[ino].extend(paths[1:])
+
+    first_occ_set = set(first_of_inode.values())
+
+    # Files to actually move: regular (nlink=1) + first occurrence of each inode
+    to_move = sorted(
+        (item for item in file_items if item in item_stats
+         and (item_stats[item].st_nlink == 1 or item in first_occ_set)),
+        key=lambda p: (len(p.parts), p),
+    )
 
     # ------------------------------------------------------------------
-    # Phase 3: regular files — parallel
+    # Phase 3: parallel batch runner + post-batch hard-link creation
     # ------------------------------------------------------------------
-    def _move_one(item: Path) -> int:
-        """Move a single regular file; returns bytes moved."""
+    def _move_one(item: Path) -> tuple[Path, int]:
+        """Move one file; returns (item, bytes_moved)."""
         if not item.exists():
-            return 0
-        st = item.stat()
+            return item, 0
+        st = item_stats.get(item) or item.stat()
         dest_file = dst / item.relative_to(src)
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         if st.st_size >= _LARGE_FILE_BYTES:
             log(f"    moving large file {item.name} ({st.st_size // 1024 // 1024} MiB)...")
         shutil.move(str(item), str(dest_file))
-        return st.st_size
+        return item, st.st_size
+
+    def _link_extras(moved_first: list[Path]) -> None:
+        """Create hard links for extra occurrences of just-moved inodes."""
+        for first in moved_first:
+            if first not in first_occ_set:
+                continue
+            st = item_stats.get(first)
+            if st is None:
+                continue
+            ino = st.st_ino
+            dest_first = dst / first.relative_to(src)
+            if not dest_first.exists():
+                continue
+            inode_map[ino] = dest_first
+            if state_file:
+                _save_inode_state(state_file, inode_map, dst)
+            for extra in extras_of_inode.get(ino, []):
+                if not extra.is_symlink() and not extra.exists():
+                    continue
+                extra_dest = dst / extra.relative_to(src)
+                extra_dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(dest_first, extra_dest)
+                    extra.unlink()
+                    nonlocal count
+                    count += 1
+                    if progress_cb:
+                        progress_cb(count, total)
+                except OSError as exc:
+                    msg = f"{extra}: {exc}"
+                    log(f"    [red][!] failed link {msg}[/red]")
+                    errors.append(msg)
+
+    # Process extras for inodes already in inode_map (resumed run)
+    for ino, extras in extras_of_inode.items():
+        if ino not in inode_map:
+            continue
+        dest_first = inode_map[ino]
+        for extra in extras:
+            if not extra.is_symlink() and not extra.exists():
+                continue
+            extra_dest = dst / extra.relative_to(src)
+            extra_dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(dest_first, extra_dest)
+                extra.unlink()
+                count += 1
+                if progress_cb:
+                    progress_cb(count, total)
+            except OSError as exc:
+                msg = f"{extra}: {exc}"
+                log(f"    [red][!] failed link {msg}[/red]")
+                errors.append(msg)
 
     def _run_batch(batch: list[Path]) -> int:
-        """Move *batch* in parallel; returns total bytes moved."""
+        """Move *batch* in parallel, then link extras. Returns total bytes moved."""
         nonlocal count
         total_bytes = 0
+        moved_first: list[Path] = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_move_one, item): item for item in batch}
             for future in as_completed(futures):
-                item = futures[future]
+                src_item = futures[future]
                 try:
-                    size = future.result()
+                    moved_item, size = future.result()
+                    if size > 0:
+                        moved_first.append(moved_item)
                     count += 1
                     total_bytes += size
                     if progress_cb:
@@ -491,23 +577,24 @@ def move_tree(
                         pct = f" ({count * 100 // total}%)" if total else ""
                         log(f"    moved {count}/{total if total else '?'}{pct} files...")
                 except OSError as exc:
-                    msg = f"{item}: {exc}"
+                    msg = f"{src_item}: {exc}"
                     log(f"    [red][!] failed {msg}[/red]")
                     errors.append(msg)
+        # Link extra hard-link occurrences for this batch's moved inodes.
+        # Runs after all workers finish — workers are idle, source still mounted.
+        _link_extras(moved_first)
         return total_bytes
 
+    # ------------------------------------------------------------------
+    # Phase 4: drive batches; deflate between them
+    # ------------------------------------------------------------------
     if deflate_every_bytes > 0 and deflate_cb:
-        # Split regular files into batches ≤ deflate_every_bytes so deflation
-        # can fire between batches (never while workers hold the source mount).
         batch: list[Path] = []
         batch_bytes = 0
-        for item in regular:
-            try:
-                sz = item.stat().st_size
-            except OSError:
-                sz = 0
+        for item in to_move:
+            st = item_stats.get(item)
             batch.append(item)
-            batch_bytes += sz
+            batch_bytes += st.st_size if st else 0
             if batch_bytes >= deflate_every_bytes:
                 moved = _run_batch(batch)
                 bytes_since_deflate += moved
@@ -518,43 +605,7 @@ def move_tree(
         if batch:
             bytes_since_deflate += _run_batch(batch)
     else:
-        bytes_since_deflate += _run_batch(regular)
-
-    # ------------------------------------------------------------------
-    # Phase 4: hard-linked files — sequential
-    # ------------------------------------------------------------------
-    for item in hardlinked:
-        if not item.is_symlink() and not item.exists():
-            continue
-        dest_file = dst / item.relative_to(src)
-        dest_file.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            st = item.stat()
-            if st.st_ino in inode_map:
-                os.link(inode_map[st.st_ino], dest_file)
-                item.unlink()
-            else:
-                if st.st_size >= _LARGE_FILE_BYTES:
-                    log(f"    moving large file {item.name} ({st.st_size // 1024 // 1024} MiB)...")
-                shutil.move(str(item), str(dest_file))
-                inode_map[st.st_ino] = dest_file
-                if state_file:
-                    _save_inode_state(state_file, inode_map, dst)
-            count += 1
-            bytes_since_deflate += st.st_size
-            if progress_cb:
-                progress_cb(count, total)
-            if count % 50 == 0:
-                pct = f" ({count * 100 // total}%)" if total else ""
-                log(f"    moved {count}/{total if total else '?'}{pct} files...")
-            if deflate_cb and deflate_every_bytes > 0 and bytes_since_deflate >= deflate_every_bytes:
-                log(f"    [deflate] {bytes_since_deflate // 1_073_741_824} GiB moved — triggering source deflation...")
-                deflate_cb()
-                bytes_since_deflate = 0
-        except OSError as exc:
-            msg = f"{item}: {exc}"
-            log(f"    [red][!] failed {msg}[/red]")
-            errors.append(msg)
+        bytes_since_deflate += _run_batch(to_move)
 
     log(f"    move_tree: {count} files moved, {len(errors)} errors")
     if state_file and state_file.exists():
