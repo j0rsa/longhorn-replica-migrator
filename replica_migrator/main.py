@@ -1022,6 +1022,265 @@ class DeflateScreen(Screen[None]):
 
 
 # ---------------------------------------------------------------------------
+# MountScreen
+# ---------------------------------------------------------------------------
+
+
+class MountScreen(Screen[None]):
+    """Spin up the recovery pod, mount source + destination, then wait.
+
+    Displays the two mount paths so the user can inspect or operate on the
+    filesystems from another terminal.  Pressing "Unmount & Back" (or
+    Ctrl+C / q) unmounts both devices and deletes the recovery pod before
+    returning to the main menu.
+    """
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("ctrl+c", "interrupt_or_quit", "Unmount & Back", show=False),
+        Binding("q", "interrupt_or_quit", "Unmount & Back", show=False),
+    ]
+
+    CSS = """
+    MountScreen {
+        layout: vertical;
+    }
+    #mount_status {
+        padding: 1 2 0 2;
+        height: 4;
+        background: $surface;
+        border-bottom: solid $accent;
+    }
+    #mount_log {
+        height: 1fr;
+        border: solid $accent;
+    }
+    #btn_mount_back {
+        margin: 1 1;
+        width: auto;
+    }
+    """
+
+    class LogLine(Message):
+        def __init__(self, text: str) -> None:
+            super().__init__()
+            self.text = text
+
+    class Ready(Message):
+        def __init__(self, src_mp: Path, dst_mp: Path) -> None:
+            super().__init__()
+            self.src_mp = src_mp
+            self.dst_mp = dst_mp
+
+    class Done(Message):
+        def __init__(self) -> None:
+            super().__init__()
+
+    def __init__(self, replica: ReplicaRow, disk: LonghornDisk,
+                 hostname: str, image: str) -> None:
+        super().__init__()
+        self._replica = replica
+        self._disk = disk
+        self._hostname = hostname
+        self._image = image
+        self._stop = threading.Event()
+        self._done = False
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Mounting devices…", id="mount_status")
+        yield RichLog(highlight=True, markup=True, id="mount_log")
+        yield Button("Unmount & Back", id="btn_mount_back",
+                     variant="warning", disabled=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._do_mount()
+
+    def on_mount_screen_log_line(self, event: MountScreen.LogLine) -> None:
+        self.query_one("#mount_log", RichLog).write(event.text)
+
+    def on_mount_screen_ready(self, event: MountScreen.Ready) -> None:
+        self.query_one("#mount_status", Static).update(
+            f"[green bold]Mounted[/green bold]  "
+            f"src → [b]{event.src_mp}[/b]   dst → [b]{event.dst_mp}[/b]"
+        )
+        btn = self.query_one("#btn_mount_back", Button)
+        btn.disabled = False
+
+    def on_mount_screen_done(self, _event: MountScreen.Done) -> None:
+        self._done = True
+        btn = self.query_one("#btn_mount_back", Button)
+        btn.label = "Back"  # type: ignore[assignment]
+        btn.variant = "default"
+        btn.disabled = False
+
+    def action_interrupt_or_quit(self) -> None:
+        if self._done:
+            cast("MigratorApp", self.app).pop_screen()  # type: ignore[misc]
+        else:
+            self._request_unmount()
+
+    def _request_unmount(self) -> None:
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        btn = self.query_one("#btn_mount_back", Button)
+        btn.label = "Unmounting…"  # type: ignore[assignment]
+        btn.disabled = True
+        self.query_one("#mount_log", RichLog).write(
+            "[yellow]Unmounting and deleting pod...[/yellow]"
+        )
+
+    @on(Button.Pressed, "#btn_mount_back")
+    def on_back(self) -> None:
+        if self._done:
+            cast("MigratorApp", self.app).pop_screen()  # type: ignore[misc]
+        else:
+            self._request_unmount()
+
+    @work(thread=True)
+    def _do_mount(self) -> None:
+        def log(text: str) -> None:
+            self.post_message(MountScreen.LogLine(text))
+
+        src_mp: Path | None = None
+        dst_mp: Path | None = None
+
+        try:
+            log("[bold][pre][/bold] Checking kubectl...")
+            rc, out, err = kube.run_cmd("kubectl", "version", "--client")
+            if out:
+                log(f"    {out}")
+            if err:
+                log(f"    {err}")
+            if rc != 0:
+                log("[red]kubectl not available — aborting.[/red]")
+                return
+
+            vol = self._replica.volume_name if self._replica.volume_name != "—" else self._replica.dir_name
+            src_device = Path("/dev/longhorn") / vol
+
+            phase = kube.pod_phase()
+            if phase is not None:
+                log(f"[yellow][!][/yellow] Existing pod found (phase={phase}), removing...")
+                kube.delete_pod()
+                time.sleep(3)
+
+            yaml_str = ops.build_pod_yaml(
+                self._replica.path, vol,
+                self._replica.size_bytes or 0,
+                self._hostname, self._image,
+            )
+            log(f"[bold][1/4][/bold] Applying recovery pod ({self._image})...")
+            rc, out = kube.apply_yaml(yaml_str)
+            if out:
+                log(f"    {out}")
+            if rc != 0:
+                log("[red]Failed to apply recovery pod — aborting.[/red]")
+                return
+
+            log("[bold][2/4][/bold] Waiting for pod Running (up to 120 s)...")
+            if not kube.wait_pod_running(cancelled=self._stop.is_set):
+                if self._stop.is_set():
+                    log("[yellow]Interrupted.[/yellow]")
+                else:
+                    log("[red]Pod did not reach Running — aborting.[/red]")
+                kube.delete_pod()
+                return
+            log("    Pod is Running")
+
+            if self._stop.is_set():
+                kube.delete_pod()
+                return
+
+            log(f"[bold][3/4][/bold] Waiting for device {src_device} (up to 60 s)...")
+            if not kube.wait_device(src_device, 60, cancelled=self._stop.is_set):
+                if self._stop.is_set():
+                    log("[yellow]Interrupted.[/yellow]")
+                else:
+                    log(f"[red]Device {src_device} did not appear — aborting.[/red]")
+                kube.delete_pod()
+                return
+            log(f"    Device {src_device} is ready")
+
+            log("[bold][4/4][/bold] Mounting source and destination...")
+            src_mp = Path(tempfile.mkdtemp(prefix="lrm-src-"))
+            dst_mp = Path(tempfile.mkdtemp(prefix="lrm-dst-"))
+
+            rc, out = ops.mount_device(src_device, src_mp)
+            if out:
+                log(f"    {out}")
+            if rc != 0:
+                log("[red]Failed to mount source — aborting.[/red]")
+                src_mp.rmdir()
+                dst_mp.rmdir()
+                kube.delete_pod()
+                return
+            log(f"    Source mounted at {src_mp}")
+
+            src_fs = ops.detect_fs_type(src_device)
+            dst_fs = ops.detect_fs_type(self._disk.path)
+            if dst_fs is None and src_fs:
+                log(f"    Target unformatted — formatting as {src_fs}...")
+                rc, out = ops.format_device(self._disk.path, src_fs)
+                if out:
+                    log(f"    {out}")
+                if rc != 0:
+                    log("[red]Failed to format target — aborting.[/red]")
+                    ops.unmount(src_mp)
+                    src_mp.rmdir()
+                    dst_mp.rmdir()
+                    kube.delete_pod()
+                    return
+
+            rc, out = ops.mount_device(self._disk.path, dst_mp)
+            if out:
+                log(f"    {out}")
+            if rc != 0:
+                log("[red]Failed to mount destination — aborting.[/red]")
+                ops.unmount(src_mp)
+                src_mp.rmdir()
+                dst_mp.rmdir()
+                kube.delete_pod()
+                return
+            log(f"    Destination mounted at {dst_mp}")
+
+            self.post_message(MountScreen.Ready(src_mp, dst_mp))
+
+            # Wait until the user requests unmount.
+            self._stop.wait()
+
+            log("Unmounting...")
+            ops.unmount(src_mp)
+            src_mp.rmdir()
+            src_mp = None
+            ops.unmount(dst_mp)
+            dst_mp.rmdir()
+            dst_mp = None
+
+            log("Deleting recovery pod...")
+            kube.delete_pod()
+            log("[green bold]✓ Unmounted[/green bold]")
+
+        except Exception as exc:
+            log(f"[red][!] Unexpected error: {exc}[/red]")
+            with contextlib.suppress(Exception):
+                if src_mp and src_mp.is_mount():
+                    ops.unmount(src_mp)
+                if src_mp and src_mp.exists():
+                    src_mp.rmdir()
+            with contextlib.suppress(Exception):
+                if dst_mp and dst_mp.is_mount():
+                    ops.unmount(dst_mp)
+                if dst_mp and dst_mp.exists():
+                    dst_mp.rmdir()
+            with contextlib.suppress(Exception):
+                kube.delete_pod()
+        finally:
+            self.post_message(MountScreen.Done())
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -1084,6 +1343,7 @@ class MigratorApp(App[None]):
         Binding("2", "select_disk", "Destination disk", show=True),
         Binding("3", "run_migration", "Run migration", show=True),
         Binding("4", "deflate_source", "Deflate source", show=True),
+        Binding("5", "mount_devices", "Mount only", show=True),
         Binding("q", "quit", "Quit", show=True),
         Binding("й", "quit", "Quit", show=False),
         Binding("ctrl+c", "quit", "Quit", show=False),
@@ -1135,6 +1395,13 @@ class MigratorApp(App[None]):
                     variant="warning",
                     disabled=True,
                 )
+                yield Button(
+                    "5 · Mount source & destination",
+                    id="btn_mount",
+                    classes="menu_btn",
+                    variant="default",
+                    disabled=True,
+                )
                 yield Button("Quit", id="btn_quit", classes="menu_btn", variant="error")
         yield Footer()
 
@@ -1161,8 +1428,10 @@ class MigratorApp(App[None]):
         else:
             block += "  [dim](none selected)[/dim]\n"
         self.query_one("#summary", Static).update(block)
-        self.query_one("#btn_run_migration", Button).disabled = not (self.selected_replica and self.selected_disk)
+        both = bool(self.selected_replica and self.selected_disk)
+        self.query_one("#btn_run_migration", Button).disabled = not both
         self.query_one("#btn_deflate", Button).disabled = not self.selected_replica
+        self.query_one("#btn_mount", Button).disabled = not both
 
     def action_select_replica(self) -> None:
         """Open the replica picker via keyboard shortcut."""
@@ -1184,6 +1453,17 @@ class MigratorApp(App[None]):
             replica=self.selected_replica,
             image=DEFAULT_IMAGE,
             hostname=kube.get_hostname(),
+        ))
+
+    def action_mount_devices(self) -> None:
+        """Open the mount screen via keyboard shortcut."""
+        if self.selected_replica is None or self.selected_disk is None:
+            return
+        self.push_screen(MountScreen(
+            replica=self.selected_replica,
+            disk=self.selected_disk,
+            hostname=kube.get_hostname(),
+            image=DEFAULT_IMAGE,
         ))
 
     @on(Button.Pressed, "#btn_replica")
@@ -1234,6 +1514,18 @@ class MigratorApp(App[None]):
         """
         if result is not None:
             self.push_screen(MigrationScreen(result))
+
+    @on(Button.Pressed, "#btn_mount")
+    def open_mount_screen(self) -> None:
+        """Open the mount-only screen."""
+        if self.selected_replica is None or self.selected_disk is None:
+            return
+        self.push_screen(MountScreen(
+            replica=self.selected_replica,
+            disk=self.selected_disk,
+            hostname=kube.get_hostname(),
+            image=DEFAULT_IMAGE,
+        ))
 
     @on(Button.Pressed, "#btn_deflate")
     def open_deflate_screen(self) -> None:
