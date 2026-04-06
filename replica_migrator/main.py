@@ -1056,12 +1056,20 @@ class MountPickScreen(ModalScreen["tuple[bool, bool] | None"]):
         Binding("down", "focus_next", show=False),
     ]
 
+    def __init__(self, has_src: bool = True, has_dst: bool = True) -> None:
+        super().__init__()
+        self._has_src = has_src
+        self._has_dst = has_dst
+
     def compose(self) -> ComposeResult:
         with Container(id="pick_panel"):
             yield Label("[b]What to mount?[/b]")
-            yield Button("Source only  (needs recovery pod)", id="btn_src", variant="primary")
-            yield Button("Destination only  (no pod needed)", id="btn_dst")
-            yield Button("Both", id="btn_both", variant="success")
+            yield Button("Source only  (needs recovery pod)", id="btn_src",
+                         variant="primary", disabled=not self._has_src)
+            yield Button("Destination only  (no pod needed)", id="btn_dst",
+                         disabled=not self._has_dst)
+            yield Button("Both", id="btn_both",
+                         variant="success", disabled=not (self._has_src and self._has_dst))
             yield Button("Cancel (Esc)", id="btn_cancel")
 
     def action_dismiss_none(self) -> None:
@@ -1518,7 +1526,7 @@ class MigratorApp(App[None]):
         both = bool(self.selected_replica and self.selected_disk)
         self.query_one("#btn_run_migration", Button).disabled = not both
         self.query_one("#btn_deflate", Button).disabled = not self.selected_replica
-        self.query_one("#btn_mount", Button).disabled = not both
+        self.query_one("#btn_mount", Button).disabled = not (self.selected_replica or self.selected_disk)
 
     def action_select_replica(self) -> None:
         """Open the replica picker via keyboard shortcut."""
@@ -1546,7 +1554,10 @@ class MigratorApp(App[None]):
         """Open the mount pick modal via keyboard shortcut."""
         if self.selected_replica is None or self.selected_disk is None:
             return
-        self.push_screen(MountPickScreen(), self._after_mount_pick)
+        self.push_screen(MountPickScreen(
+                has_src=self.selected_replica is not None,
+                has_dst=self.selected_disk is not None,
+            ), self._after_mount_pick)
 
     @on(Button.Pressed, "#btn_replica")
     def open_replica_picker(self) -> None:
@@ -1602,7 +1613,10 @@ class MigratorApp(App[None]):
         """Open the mount pick modal."""
         if self.selected_replica is None or self.selected_disk is None:
             return
-        self.push_screen(MountPickScreen(), self._after_mount_pick)
+        self.push_screen(MountPickScreen(
+                has_src=self.selected_replica is not None,
+                has_dst=self.selected_disk is not None,
+            ), self._after_mount_pick)
 
     def _after_mount_pick(self, result: "tuple[bool, bool] | None") -> None:
         if result is None or self.selected_replica is None or self.selected_disk is None:
