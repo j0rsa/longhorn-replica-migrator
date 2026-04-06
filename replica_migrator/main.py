@@ -77,6 +77,8 @@ class ConfirmDeleteScreen(ModalScreen[bool]):
         Binding("n", "dismiss_false", "No", show=True),
         Binding("y", "action_confirm_delete", "Yes, delete", show=True),
         Binding("ctrl+c", "app.quit", "Quit", show=False),
+        Binding("up", "focus_previous", show=False),
+        Binding("down", "focus_next", show=False),
     ]
 
     def __init__(self, path: Path) -> None:
@@ -343,6 +345,8 @@ class ConfigScreen(ModalScreen[MigrationConfig | None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "action_dismiss_none", "Cancel", show=True),
         Binding("ctrl+c", "app.quit", "Quit", show=False),
+        Binding("up", "focus_previous", show=False),
+        Binding("down", "focus_next", show=False),
     ]
 
     def __init__(self, replica: ReplicaRow, disk: LonghornDisk) -> None:
@@ -449,6 +453,8 @@ class MigrationScreen(Screen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "interrupt_or_quit", "Interrupt", show=False),
         Binding("q", "interrupt_or_quit", "Interrupt", show=False),
+        Binding("up", "focus_previous", show=False),
+        Binding("down", "focus_next", show=False),
     ]
 
     CSS = """
@@ -841,6 +847,8 @@ class DeflateScreen(Screen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "interrupt_or_quit", "Interrupt", show=False),
         Binding("q", "interrupt_or_quit", "Interrupt", show=False),
+        Binding("up", "focus_previous", show=False),
+        Binding("down", "focus_next", show=False),
     ]
 
     CSS = """
@@ -1044,6 +1052,8 @@ class MountPickScreen(ModalScreen["tuple[bool, bool] | None"]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "dismiss_none", "Cancel", show=True),
         Binding("ctrl+c", "app.quit", "Quit", show=False),
+        Binding("up", "focus_previous", show=False),
+        Binding("down", "focus_next", show=False),
     ]
 
     def compose(self) -> ComposeResult:
@@ -1086,6 +1096,8 @@ class MountScreen(Screen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "interrupt_or_quit", "Unmount & Back", show=False),
         Binding("q", "interrupt_or_quit", "Unmount & Back", show=False),
+        Binding("up", "focus_previous", show=False),
+        Binding("down", "focus_next", show=False),
     ]
 
     CSS = """
